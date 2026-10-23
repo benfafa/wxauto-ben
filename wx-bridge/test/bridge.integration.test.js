@@ -40,9 +40,9 @@ function makeAgent(reply = '你好，我在。') {
 }
 
 function makeBridge({ agent = makeAgent(), collector = makeCollector(), behavior = {},
-  stickers, vision, proactive, groups = ['群A'], logger = quietLogger } = {}) {
+  stickers, vision, proactive, conversation, groups = ['群A'], logger = quietLogger } = {}) {
   const cfg = {
-    stickers, vision, proactive,
+    stickers, vision, proactive, conversation,
     wechat: {
       groups,
       mentionAliases: ['@小助手'],
@@ -402,4 +402,65 @@ test('prompt tells the model which attached images came from whom', () => {
   const plain = buildPrompt({ group: 'g', sender: 'a', text: 't', context: '', vision: { enabled: true }, images: [] });
   assert.ok(!plain.includes('【本轮附图】'));
   assert.ok(plain.includes('没有附图时不得声称看见图片'));
+});
+
+test('同一人 60 秒内被 @ 三次后，不带 @ 也继续回，且回复不再 @ 他', async () => {
+  const collector = makeCollector();
+  const agent = makeAgent('好，接着说。');
+  const { bridge } = makeBridge({
+    conversation: { enabled: true, triggerMentions: 3, windowMs: 60000, idleTimeoutMs: 300000, maxTurns: 40, groups: [] },
+    agent, collector
+  });
+  for (let i = 0; i < 3; i += 1) {
+    await bridge.handleEvent({ group: '群A', sender: '张三', text: `@小助手 第${i}次`, id: `m${i}`, seq: i + 1 });
+  }
+  await bridge.flush();
+  assert.equal(agent.calls.length, 3);
+  assert.equal(collector.sent.length, 3);
+  // 第三次就已经算进入会话模式，回复不再带 @
+  assert.equal(collector.sent[2].at, null);
+
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '那你说说看', id: 'm9', seq: 9 });
+  await bridge.flush();
+  assert.equal(agent.calls.length, 4);
+  assert.match(agent.calls[3].prompt, /连续对话/);
+  assert.equal(collector.sent[3].at, null);
+  assert.equal(collector.sent[3].text, '好，接着说。');
+});
+
+test('没凑满三次、或者换个人不带 @，都不会触发', async () => {
+  const agent = makeAgent('不该出现');
+  const collector = makeCollector();
+  const bridge = makeBridge({
+    conversation: { enabled: true, triggerMentions: 3, windowMs: 60000, idleTimeoutMs: 300000, maxTurns: 40, groups: [] },
+    agent, collector
+  }).bridge;
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '@小助手 一', id: 'a1', seq: 1 });
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '@小助手 二', id: 'a2', seq: 2 });
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '只有两次', id: 'a3', seq: 3 });
+  await bridge.flush();
+  assert.equal(agent.calls.length, 2);
+
+  // 别人被 @ 三次后开启的是别人的会话，张三不该被顺带接管
+  for (let i = 0; i < 3; i += 1) {
+    await bridge.handleEvent({ group: '群A', sender: '李四', text: `@小助手 李${i}`, id: `b${i}`, seq: 10 + i });
+  }
+  await bridge.flush();
+  const before = agent.calls.length;
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '我还是不带@', id: 'b9', seq: 20 });
+  await bridge.flush();
+  assert.equal(agent.calls.length, before);
+});
+
+test('conversation 关闭时不生效', async () => {
+  const agent = makeAgent('不该出现');
+  const bridge = makeBridge({ agent }).bridge;
+  for (let i = 0; i < 3; i += 1) {
+    await bridge.handleEvent({ group: '群A', sender: '张三', text: `@小助手 ${i}`, id: `c${i}`, seq: i + 1 });
+  }
+  await bridge.flush();
+  const before = agent.calls.length;
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '不带@', id: 'c9', seq: 9 });
+  await bridge.flush();
+  assert.equal(agent.calls.length, before);
 });

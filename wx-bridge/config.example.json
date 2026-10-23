@@ -69,5 +69,13 @@
     "activityWindowMs": 120000,
     "minRecentMessages": 2,
     "groups": []
+  },
+  "conversation": {
+    "enabled": false,
+    "triggerMentions": 3,
+    "windowMs": 60000,
+    "idleTimeoutMs": 300000,
+    "maxTurns": 40,
+    "groups": []
   }
 }

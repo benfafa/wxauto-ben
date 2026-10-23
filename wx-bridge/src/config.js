@@ -3,6 +3,7 @@ import path from 'node:path';
 import { normalizeStickers } from './stickers.js';
 import { normalizeVision } from './vision.js';
 import { normalizeProactive } from './proactive.js';
+import { normalizeConversation } from './conversation.js';
 
 const DEFAULTS = Object.freeze({
   wechat: {
@@ -213,6 +214,14 @@ export function loadConfig(file) {
     stateDir,
     stickers: normalizeStickers(raw.stickers, baseDir),
     vision: normalizeVision(raw.vision),
+    conversation: (() => {
+      const conversation = normalizeConversation(raw.conversation);
+      const unknown = conversation.groups.filter((name) => !groups.includes(name));
+      if (unknown.length) {
+        throw new Error(`conversation.groups 里有没被监听的群：${unknown.join('、')}`);
+      }
+      return conversation;
+    })(),
     proactive: (() => {
       const proactive = normalizeProactive(raw.proactive);
       const unknown = proactive.groups.filter((name) => !groups.includes(name));

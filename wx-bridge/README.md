@@ -332,6 +332,21 @@ collector 会再校验一次扩展名、magic、大小、真实路径和目录�
 
 行为要点：主动回合不 @ 任何人；提示词把「沉默」设成默认答案，模型返回空 `text` 就什么都不发；只有严格按 `{"text":"...","stickerId":...}` 协议返回且 `text` 非空才会发送——散文、坏 JSON、多余字段一律当沉默，绝不把提示词或控制串漏进群。主动回合同样可以按语境带一张表情（走同一份白名单与索引）。`state/activity.jsonl` 里会看到 `proactive-trigger` / `proactive-sent` / `proactive-declined` / `proactive-skip`（`reason` 为 `chance` 或 `hourly-cap`），用来回看它为什么说话或为什么憋住。自己发的消息不计入活跃度，有 @ 回合在排队或正在处理时也不会插队。
 
+### conversation（可选，默认关闭）
+
+同一个人在 `windowMs` 内被 @ 满 `triggerMentions` 次后，接下来他**不带 @** 的消息也会回，并且回复里不再 @ 他——像真的接上了话。绑定的是「群 + 人」，别人照旧要 @；进程重启后记忆清空，需要重新 @ 满次数。
+
+| 字段 | 说明 | 默认 |
+| --- | --- | --- |
+| `enabled` | 是否启用连续对话 | `false` |
+| `triggerMentions` | 窗口内被同一个人 @ 几次后开启（2~10） | `3` |
+| `windowMs` | 计数窗口（5000~600000） | `60000` |
+| `idleTimeoutMs` | 多久没说话自动退出（10000~3600000） | `300000` |
+| `maxTurns` | 连续对话最多回几轮，到顶就要求重新 @（1~500） | `40` |
+| `groups` | 只在这些群里生效；空数组表示所有监听群 | `[]` |
+
+`activity.jsonl` 里会记录 `conversation-open` / `conversation-follow` / `conversation-close`（`reason=max-turns`），方便回看它什么时候接管、什么时候退出。
+
 ### stateDir
 
 `state/` 保存：
