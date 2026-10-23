@@ -166,6 +166,24 @@ test('rebuilds the session once when DSH says session/not-found', async () => {
   }
 });
 
+test('reuses a stored session only after re-following it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-bridge-dsh-'));
+  const fake = createFakeApi();
+  const store = new MemoryStore();
+  store.set('群A', 's1');            // bridge 重启后从 sessions.json 读回的旧会话
+  const agent = new DshAgent(makeConfig(dir), { store, logger: quietLogger, api: fake.api });
+  await agent.start();
+  try {
+    const result = await agent.ask('群A', '重启后的第一条');
+    assert.equal(result.text, '最终回复');
+    assert.equal(fake.created, 0, '旧会话可用时不应重建');
+    assert.deepEqual(fake.followed, ['s1'], '必须重新 follow，否则收不到 turn 事件');
+  } finally {
+    await agent.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('verified inline content survives session rebuild with one accepted turn', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-bridge-dsh-'));
   const fake = createFakeApi({ promptErrorOnce: { code: 'session/not-found', message: 'gone' } });

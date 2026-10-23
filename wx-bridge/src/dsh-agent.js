@@ -211,7 +211,13 @@ export class DshAgent {
     const existing = this.store.get(group);
     if (existing) {
       const applied = await this.#applyModel(existing);
-      if (applied !== 'not-found') return existing;
+      if (applied !== 'not-found') {
+        // follow 集合只活在进程内存里（DSH 客户端跨重连保留，但跨进程重启不保留）。
+        // 复用旧会话时必须重新 follow，否则这个会话的 turn 事件永远收不到，
+        // 表现就是每次 @ 都干等到 turnTimeoutMs 才报超时。
+        this.api.events.follow(existing);
+        return existing;
+      }
       this.log.warn(`群「${group}」的 DSH 会话已不存在，重建：${existing}`);
       this.store.remove(group);
     }
