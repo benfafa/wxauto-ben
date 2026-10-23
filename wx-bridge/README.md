@@ -79,6 +79,7 @@ wx-bridge/
   scripts/label-stickers-minimax.py  本地 MiniMax 视觉打标，产出 sticker-index.json
   scripts/build-sticker-library.py   按标签整理可部署曲库（过滤不安全/被拒审/命中剔除词）
   scripts/caption-stickers.mjs       在服务器上用 DSH 打标的备选实现
+  deploy/watchdog.ps1             服务器侧每分钟看门狗：断线重挂 console、拉起守护脚本
   test/                 Node 测试
   collector/tests/      Python 测试
   config.example.json
