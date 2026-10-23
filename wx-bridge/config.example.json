@@ -1,0 +1,46 @@
+{
+  "wechat": {
+    "collectorUrl": "http://127.0.0.1:8765",
+    "token": "REPLACE_WITH_AT_LEAST_16_RANDOM_CHARS",
+    "groups": [
+      "测试群"
+    ],
+    "mentionAliases": [
+      "@机器人"
+    ],
+    "pollMs": 800,
+    "pollWaitMs": 15000,
+    "requestTimeoutMs": 30000,
+    "contextMessages": 20,
+    "contextMaxChars": 4000
+  },
+  "dsh": {
+    "baseUrl": "http://127.0.0.1:3080",
+    "authToken": "",
+    "allowRemote": false,
+    "provider": "deepseek-official",
+    "model": "deepseek-flash",
+    "reasoningEffort": "max",
+    "agentPreset": "wx-chat",
+    "verifyPreset": true,
+    "allowDefaultPreset": false,
+    "workspaceTitle": "微信群聊",
+    "sessionCwd": "",
+    "turnTimeoutMs": 120000,
+    "streamReconnectMs": 3000
+  },
+  "behavior": {
+    "requireMention": true,
+    "replyWithMention": true,
+    "minReplyIntervalMs": 1500,
+    "maxRepliesPerMinute": 12,
+    "maxTriggerAgeMs": 300000,
+    "maxReplyChars": 1200,
+    "sendErrorNotice": false,
+    "logAllMessages": true,
+    "globalConcurrency": 2,
+    "maxQueuePerGroup": 10,
+    "partDelayMs": 500
+  },
+  "stateDir": "state"
+}

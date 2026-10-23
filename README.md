@@ -1,5 +1,6 @@
 # wxauto (2021-2025)
 
+> 本仓库新增了 [`wx-bridge/`](wx-bridge/README.md)：在归档版 wxauto 之上实现“微信群聊监控 + 被 @ 时调用 DSH agent 回复”的桥接。包含 Windows 采集端、Node 桥接、无工具 DSH preset、测试与部署说明。
 
 |  环境  | 版本 |
 | :----: | :--: |

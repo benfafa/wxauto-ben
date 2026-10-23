@@ -8,4 +8,6 @@ __pycache__/
 *.ipynb
 *.bat
 @AutomationLog.txt
- 
+
+# wx-bridge Windows launcher is source, not a generated artifact
+!wx-bridge/start.bat
