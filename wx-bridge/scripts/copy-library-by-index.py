@@ -46,6 +46,7 @@ def main(argv=None):
     parser.add_argument("--src", required=True, help="原始图片所在目录（只扫一层）")
     parser.add_argument("--dst", required=True, help="上线目录，脚本只往这里写")
     parser.add_argument("--remove-extra", action="store_true", help="删除 dst 里索引没提到的文件")
+    parser.add_argument("--manifest", help="把本次要上线的文件名一行一个写到这里，给 PowerShell 读，省得它解析 JSON")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -87,6 +88,9 @@ def main(argv=None):
             shutil.copyfile(source, target)
 
     extra = []
+    if args.manifest:
+        Path(args.manifest).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.manifest).write_text("\n".join(sorted(wanted)) + "\n", encoding="utf-8")
     if dst.is_dir():
         extra = [p.name for p in dst.iterdir() if p.is_file() and p.name not in wanted]
     print(f"[copy] 索引 {len(index)} 条：新拷 {copied}，已存在且一致 {identical}，"

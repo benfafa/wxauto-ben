@@ -43,7 +43,9 @@ try {
 
     $bridge = @(Get-ChildItem -Path $staging -Recurse -Filter 'bridge.js' | Select-Object -First 1)
     if (-not $bridge) { throw "src/bridge.js missing from the zip" }
-    $codeRoot = $bridge[0].Directory.FullName
+    # bridge.js lives in <codeRoot>/src, so the project root is one level up.
+    $codeRoot = $bridge[0].Directory.Parent.FullName
+    if (-not (Test-Path (Join-Path $codeRoot 'package.json'))) { throw "unexpected code root: $codeRoot" }
     Say "code root: $codeRoot"
 
     $indexFile = @(Get-ChildItem -Path $staging -Recurse -Filter 'sticker-index.json' | Select-Object -First 1)
@@ -55,34 +57,45 @@ try {
 
     # Code first, config last, so a crash never leaves a config pointing at
     # files that are not on disk yet.
+    $copiedDirs = 0
     foreach ($item in @('src', 'collector', 'preset', 'scripts')) {
         $from = Join-Path $codeRoot $item
         if (Test-Path $from) {
             Copy-Item -Path $from -Destination $Root -Recurse -Force
+            $copiedDirs = $copiedDirs + 1
             Say "updated $item"
         }
     }
+    if ($copiedDirs -lt 4) { throw "only $copiedDirs/4 code folders copied; aborting before config changes" }
     Copy-Item -Path (Join-Path $codeRoot 'package.json') -Destination $Root -Force -ErrorAction SilentlyContinue
 
     $targetStickers = Join-Path $Root 'stickers'
     New-Item -ItemType Directory -Force -Path $targetStickers | Out-Null
     Copy-Item -Path $indexSource -Destination (Join-Path $Root 'sticker-index.json') -Force
+    $manifest = Join-Path $Root 'logs\sticker-manifest.txt'
     if ($LabDirectory) {
         # Images are already on the server; rebuild the live folder from the index
         # and verify every sha256 instead of uploading 300MB again.
         $copyPy = Join-Path $Root 'scripts\copy-library-by-index.py'
         & C:\Python311\python.exe $copyPy --index (Join-Path $Root 'sticker-index.json') `
-            --src $LabDirectory --dst $targetStickers 2>&1 | ForEach-Object { Say "copy: $_" }
+            --src $LabDirectory --dst $targetStickers --manifest $manifest 2>&1 | ForEach-Object { Say "copy: $_" }
     }
     else {
         Copy-Item -Path (Join-Path $images '*') -Destination $targetStickers -Force
+        (Get-ChildItem $images -File | Select-Object -ExpandProperty Name) | Set-Content -Path $manifest -Encoding UTF8
     }
     $count = (Get-ChildItem $targetStickers -File | Measure-Object).Count
     Say "stickers: $count files in $targetStickers"
 
     # Anything in the live folder that the curated release does not know about is
     # reported, not removed, unless -Prune was passed explicitly.
-    $release = @((Get-Content -Raw -Path (Join-Path $Root 'sticker-index.json') | ConvertFrom-Json).PSObject.Properties.Name)
+    # PowerShell 5.1 reads files as ANSI by default, which corrupts the Chinese in
+    # these files, so every read here names UTF-8 explicitly.
+    $release = @()
+    if (Test-Path $manifest) {
+        $release = @(Get-Content -Path $manifest -Encoding UTF8 | Where-Object { $_ })
+    }
+    if (-not $release.Count) { throw "manifest empty or missing: $manifest" }
     $extra = @(Get-ChildItem $targetStickers -File | Where-Object { $release -notcontains $_.Name })
     $pruneLog = Join-Path $Root 'logs\sticker-prune.txt'
     if ($extra.Count) {
@@ -98,7 +111,7 @@ try {
     }
 
     $configPath = Join-Path $Root 'config.json'
-    $config = Get-Content -Raw -Path $configPath | ConvertFrom-Json
+    $config = Get-Content -Raw -Encoding UTF8 -Path $configPath | ConvertFrom-Json
     $stickers = [PSCustomObject]@{
         enabled        = $true
         directory      = 'stickers'
@@ -126,17 +139,28 @@ try {
 
     $checkPy = Join-Path $Root 'scripts\check-sticker-catalog.py'
     & C:\Python311\python.exe $checkPy $configPath 2>&1 | ForEach-Object { Say "collector: $_" }
-    & node (Join-Path $Root 'scripts\check-sticker-config.mjs') $configPath 2>&1 | ForEach-Object { Say "node: $_" }
+    # TAT runs as System with a minimal PATH, so never rely on `node` resolving.
+    $nodeCmd = 'C:\Program Files\nodejs\node.exe'
+    if (-not (Test-Path $nodeCmd)) { $nodeCmd = (Get-Command node -ErrorAction SilentlyContinue).Source }
+    if ($nodeCmd) {
+        & $nodeCmd (Join-Path $Root 'scripts\check-sticker-config.mjs') $configPath 2>&1 | ForEach-Object { Say "node: $_" }
+    } else {
+        Say 'node.exe not found; skipped the Node-side self-check'
+    }
 
     # Only the bridge and the collector are stopped; DSH and WeChat stay up and the
     # supervisor relaunches what died within about 30 seconds.
     Say 'restarting bridge and collector'
-    Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-        Where-Object { $_.CommandLine -like '*bridge.js*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-        Where-Object { $_.CommandLine -like '*wx_collector*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    try {
+        Get-CimInstance Win32_Process |
+            Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*bridge.js*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+        Get-CimInstance Win32_Process |
+            Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*wx_collector*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    } catch {
+        Say "restart warning: $($_.Exception.Message)"
+    }
     Say 'done'
 }
 catch {
