@@ -80,6 +80,16 @@ class WxAutoBackendTest(unittest.TestCase):
         else:
             sys.modules["wxauto"] = self._previous
 
+
+    def test_own_emotion_and_time_rows_are_filtered_by_attr(self):
+        chat = self.backend.chats["群A"]
+        chat.messages = [
+            V4Message(msg_type="emotion", attr="self", content="动画表情", msg_id="e1"),
+            V4Message(msg_type="text", attr="friend", sender="李四", content="你好", msg_id="e2"),
+            V4Message(msg_type="time", attr="system", content="23:10", msg_id="e3"),
+        ]
+        events = self.backend.poll()
+        self.assertEqual([event["id"] for event in events], ["e2"])
     def test_message_conversion_and_self_filter(self):
         chat = self.backend.chats["群A"]
         chat.messages = [
@@ -193,6 +203,32 @@ class SubWindowFake:
         return [FakeMessage(msg_type="self", content=f"m{i}", msg_id=f"s{i}") for i in range(len(self.messages))]
 
 
+class V4Message:
+    """wxauto4 41.1.7 的真实形状：attr 是「谁发的」，type 是「什么类型」。"""
+
+    def __init__(self, msg_type="text", attr="friend", sender="张三", content="", msg_id="m"):
+        self.type = msg_type
+        self.attr = attr
+        self.sender = sender
+        self.content = content
+        self.id = msg_id
+
+
+class GrowingSubWindow:
+    def __init__(self, self_attr=True):
+        self.calls = []
+        self.self_attr = self_attr
+        self.messages = [V4Message(msg_type="emotion", attr="self", content="动画表情", msg_id="s0")]
+
+    def SendFiles(self, filepath):
+        self.calls.append(filepath)
+        self.messages.append(V4Message(msg_type="emotion", attr=self.self_attr and "self" or "friend",
+                                       content="动画表情", msg_id="s%d" % len(self.messages)))
+        return {"status": "成功", "message": None, "data": None}
+
+    def GetAllMessage(self):
+        return list(self.messages)
+
 class StickerDeliveryTest(unittest.TestCase):
     def setUp(self):
         module = types.ModuleType("wxauto")
@@ -230,6 +266,21 @@ class StickerDeliveryTest(unittest.TestCase):
         self.backend.delivery_wait_seconds = 0.2
         with self.assertRaises(RuntimeError):
             self.backend.send_sticker("群A", "happy.png", "happy")
+
+    def test_wxauto4_attr_shape_confirms_delivery(self):
+        sub = GrowingSubWindow()
+        self.backend.chats["群A"] = sub
+        self.backend.delivery_wait_seconds = 0.5
+        result = self.backend.send_sticker("群A", "001.gif", "001")
+        self.assertEqual(sub.calls, ["001.gif"])
+        self.assertTrue(result["delivered"])
+
+    def test_someone_elses_new_message_does_not_confirm_my_send(self):
+        sub = GrowingSubWindow(self_attr=False)
+        self.backend.chats["群A"] = sub
+        self.backend.delivery_wait_seconds = 0.3
+        with self.assertRaises(RuntimeError):
+            self.backend.send_sticker("群A", "001.gif", "001")
 
     def test_falls_back_to_main_window_when_subwindow_is_gone(self):
         self.backend.chats["群A"] = SubWindowFake(raises=True)

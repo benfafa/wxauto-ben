@@ -22,6 +22,20 @@ MEDIA_RE = re.compile(
 )
 
 
+SKIP_ATTRS = ("self", "system", "sys", "time", "recall")
+
+
+def _attr(message):
+    """wxauto4 keeps the sender class in `attr` and the content kind in `type`
+    (a sticker I sent reads type='emotion', attr='self'); the archived wxauto
+    build put the sender class in `type` instead. Accept both."""
+    return str(getattr(message, "attr", "") or "").lower()
+
+
+def _is_self(message):
+    return _attr(message) == "self" or str(getattr(message, "type", "") or "").lower() == "self"
+
+
 class WxAutoBackend:
     name = "wxauto"
 
@@ -186,7 +200,7 @@ class WxAutoBackend:
 
     def _convert(self, group, message):
         msg_type = str(getattr(message, "type", "") or "")
-        if msg_type in ("self", "sys", "time", "recall", ""):
+        if _attr(message) in SKIP_ATTRS or msg_type in ("self", "sys", "time", "recall", ""):
             return None
         content = getattr(message, "content", "")
         if not isinstance(content, str):
@@ -240,7 +254,7 @@ class WxAutoBackend:
         ids = sorted(
             str(getattr(message, "id", "") or "")
             for message in messages
-            if str(getattr(message, "type", "") or "") == "self"
+            if _is_self(message)
         )
         return ids if any(ids) else [str(len(ids))]
 
