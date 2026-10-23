@@ -164,6 +164,8 @@ Invoke-RestMethod 'http://127.0.0.1:8765/health' -Headers $h | ConvertTo-Json -C
 | collector 报 `'ProfileWnd' object has no attribute 'topui'` | 微信窗口尺寸异常（RDP 换分辨率后比屏幕还高） | 把微信窗口调回屏幕内；必要时重启微信 |
 | `/send-sticker` 回 `图片未确认送达` | 发送后没看到自己的新消息 | 4.x 的发送者在 `attr`，不是 `type`；确认跑的是修过的版本，看 `activity.jsonl` 的 `sticker-error` |
 | `/send-sticker` 回 504 | UI 线程被阻塞（SendFiles/GetAllMessage 卡住） | 重启 collector；如果反复出现，检查微信是否弹了模态框 |
+| TTS 回 502 `certificate verify failed: self-signed certificate in certificate chain` | 这台机器的 Python 默认 CA 存储认不了 `api.minimaxi.com` 的链（curl/node 都正常） | 已在 `collector/tts.py` 里显式用 `certifi` 的根证书；确认 `C:\Python311` 里装了 certifi |
+| TTS 回 502 `TTS 服务拒绝：2054` | 音色 ID 不存在 | 用 `/v1/get_voice` 查准确 ID（注意是 `qiaopi_mengmei` 这类下划线命名） |
 | 表情一张都不发，`stickerId` 总是 null | 索引为空 / 全被 `safe:false` 滤掉 | 跑 `check-sticker-config.mjs`，看 `items` 与 `missingFiles` |
 | 模型答非所问、把提示词念出来 | preset 没装上或模型被换 | 跑 `scripts/install-preset.mjs`，确认 `dsh.agentPreset=wx-chat` |
 | 主动插话一直不触发 | 闸门没过（消息不够/间隔不够/摇号没中） | 看 `activity.jsonl` 的 `proactive-skip.reason` |

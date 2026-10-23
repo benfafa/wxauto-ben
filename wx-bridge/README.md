@@ -347,6 +347,23 @@ collector 会再校验一次扩展名、magic、大小、真实路径和目录�
 
 `activity.jsonl` 里会记录 `conversation-open` / `conversation-follow` / `conversation-close`（`reason=max-turns`），方便回看它什么时候接管、什么时候退出。
 
+### tts（可选，默认关闭）
+
+被明确要求「发条语音 / 念给我听」时，把回复合成成 mp3 发出去（微信里是可播放的音频文件，不是按住说话的语音气泡——wxauto4 没有原生语音接口）。合成在采集端做，HTTP 上只传文字和群名，mp3 不出回环。
+
+| 字段 | 说明 | 默认 |
+| --- | --- | --- |
+| `enabled` | 是否启用语音回复 | `false` |
+| `provider` | `minimax`（走 MiniMax T2A）或 `edge`（需装 edge-tts） | `minimax` |
+| `keyFile` | provider=minimax 时的 Key 文件路径；不要写进仓库 | 空 |
+| `model` / `voice` | 音色模型与音色 ID；软萌傲娇猫娘用 `speech-02-hd` + `qiaopi_mengmei` | `speech-02-hd` / `qiaopi_mengmei` |
+| `speed` / `pitch` | 语速（0.5~2）与音调（-12~12） | `1.05` / `2` |
+| `maxChars` | 单条最多合成多少字，超出在标点处截断 | `300` |
+| `maxBytes` | 合成结果上限 | `5242880` |
+| `timeoutMs` | 合成超时 | `60000` |
+
+触发是确定性的：只有消息里出现「用语音说」「发条语音」「念给我听」这类说法才走语音；「别发语音」不会触发。合成或发送失败会退回文字，不会让这条消息空着。`activity.jsonl` 记 `voice-sent` / `voice-error`。
+
 ### stateDir
 
 `state/` 保存：

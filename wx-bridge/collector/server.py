@@ -13,6 +13,7 @@ import hmac
 import json
 import logging
 import queue
+import shutil
 import threading
 import time
 import uuid
@@ -21,9 +22,11 @@ from concurrent.futures import Future, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from collector.stickers import StickerCatalog, StickerError
+from collector.tts import TtsError, normalize_tts, synthesize
 from collector.vision import ImageCache
 
 
@@ -67,9 +70,18 @@ class ImageJob:
     future: Future
 
 
+@dataclass
+class TtsJob:
+    group: str
+    path: Path
+    folder: Path
+    size: int
+    future: Future
+
+
 class CollectorService:
     def __init__(self, backend, token, *, allowed_groups=None, poll_ms=800,
-                 host="127.0.0.1", port=0, allow_inject=False, stickers=None, vision=None):
+                 host="127.0.0.1", port=0, allow_inject=False, stickers=None, vision=None, tts=None):
         if not token:
             raise ValueError("collector token 不能为空")
         # backend 可以是实例（fake/测试），也可以是工厂函数（wxauto 必须在 UI 线程里构造，
@@ -91,6 +103,7 @@ class CollectorService:
         self.allow_inject = allow_inject
         self.stickers = stickers if stickers is not None else StickerCatalog()
         self.images = ImageCache(vision)
+        self.tts = tts if tts is not None else normalize_tts()
 
         self.collector_id = uuid.uuid4().hex
         self._events = deque(maxlen=MAX_EVENTS)
@@ -187,7 +200,7 @@ class CollectorService:
                             # Do not expose paths, downloaded bytes or backend exception data.
                             logging.warning("image retrieval failed: group=%s imageId=%s", job.group, job.image_id)
                             job.future.set_exception(ValueError("image-unavailable: 未能读取图片"))
-                elif isinstance(job, (SendJob, StickerJob)):
+                elif isinstance(job, (SendJob, StickerJob, TtsJob)):
                     self._handle_send(job)
         finally:
             self.images.close()
@@ -226,10 +239,18 @@ class CollectorService:
     def _handle_send(self, job):
         if not job.future.set_running_or_notify_cancel():
             logging.warning("send job expired before the UI worker started: group=%s", job.group)
+            if isinstance(job, TtsJob):
+                shutil.rmtree(job.folder, ignore_errors=True)
             return
         sticker_id = job.sticker_id if isinstance(job, StickerJob) else None
         try:
-            if isinstance(job, StickerJob):
+            if isinstance(job, TtsJob):
+                result = self.backend.send_file(job.group, str(job.path), what="语音")
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    raise RuntimeError("voice send was not confirmed")
+                logging.info("voice sent: group=%s bytes=%s", job.group, job.size)
+                result = {"ok": True, "bytes": job.size}
+            elif isinstance(job, StickerJob):
                 file = self.stickers.validate(sticker_id)
                 result = self.backend.send_sticker(job.group, str(file), sticker_id)
                 if not isinstance(result, dict) or result.get("ok") is not True:
@@ -246,6 +267,10 @@ class CollectorService:
         except Exception as error:
             logging.exception("backend send failed: group=%s stickerId=%s", job.group, sticker_id)
             job.future.set_exception(error)
+        finally:
+            if isinstance(job, TtsJob):
+                # 合成出来的临时目录只活到这一条发送结束。
+                shutil.rmtree(job.folder, ignore_errors=True)
 
     # ── API operations ───────────────────────────────────────────
     def health(self):
@@ -333,6 +358,25 @@ class CollectorService:
         if self.backend is None:
             raise ApiError(503, "backend-not-ready", self._backend_init_error or "backend starting")
         return self._submit_send(StickerJob(group=group, sticker_id=sticker_id, future=Future()))
+
+    def send_tts(self, group, text):
+        group = str(group or "").strip()
+        if group not in self.allowed_groups:
+            raise ApiError(403, "group-not-allowed", f"群不在白名单：{group}")
+        if not self.tts["enabled"]:
+            raise ApiError(403, "tts-disabled", "语音回复未启用")
+        if self.backend is None:
+            raise ApiError(503, "backend-not-ready", self._backend_init_error or "backend starting")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError(400, "empty-text", "text 不能为空")
+        if len(text) > self.tts["maxChars"] * 4:
+            raise ApiError(400, "text-too-long", "text 过长")
+        try:
+            path, folder = synthesize(self.tts, text)
+        except TtsError as error:
+            raise ApiError(502, "tts-failed", str(error)) from error
+        size = path.stat().st_size
+        return self._submit_send(TtsJob(group=group, path=path, folder=folder, size=size, future=Future()))
 
     def image(self, group, image_id):
         if not isinstance(group, str) or group not in self.allowed_groups:
@@ -488,6 +532,12 @@ class CollectorService:
                             raise ApiError(400, "bad-sticker-body", "仅允许 group 和 stickerId")
                         result = service.send_sticker(body["group"], body["stickerId"])
                         self._send_json(200, result)
+                        return
+                    if parsed.path == "/send-tts":
+                        body = self._read_json()
+                        if set(body) != {"group", "text"}:
+                            raise ApiError(400, "bad-tts-body", "仅允许 group 和 text")
+                        self._send_json(200, service.send_tts(body["group"], body["text"]))
                         return
                     if parsed.path == "/inject":
                         body = self._read_json()

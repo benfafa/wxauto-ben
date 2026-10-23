@@ -282,10 +282,11 @@ class WxAutoBackend:
         self._check_send_result(result)
         return {"ok": True}
 
-    def send_sticker(self, group, filepath, sticker_id):
+    def send_file(self, group, filepath, *, what="文件"):
+        """通用文件发送（表情图、TTS 语音都走这里）：发完必须确认微信里真的多了一条。"""
         if group not in self.groups:
             raise ValueError(f"group not allowed: {group}")
-        # SendFiles is a file-send API, not a native WeChat sticker API.
+        # SendFiles 是文件接口，不是微信原生的表情/语音气泡接口。
         target = self._chat_target(group)
         before = self._self_signature(target)
         try:
@@ -309,5 +310,9 @@ class WxAutoBackend:
                 else self.wx.SendFiles(filepath, who=group)
             self._check_send_result(result)
         if not self._wait_until_delivered(target, before):
-            raise RuntimeError("图片未确认送达：微信里没有出现新的发送记录")
-        return {"ok": True, "stickerId": sticker_id, "delivered": True}
+            raise RuntimeError(f"{what}未确认送达：微信里没有出现新的发送记录")
+        return {"ok": True, "delivered": True}
+
+    def send_sticker(self, group, filepath, sticker_id):
+        result = self.send_file(group, filepath, what="图片")
+        return {**result, "stickerId": sticker_id}

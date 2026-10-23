@@ -119,6 +119,16 @@ export class CollectorClient {
     });
   }
 
+  sendTts({ group, text, signal }) {
+    // 合成在采集端做（mp3 不出回环），这里只给文字。
+    return this.request('/send-tts', {
+      method: 'POST',
+      body: { group, text },
+      signal,
+      timeoutMs: Math.max(this.timeoutMs, 60000)
+    });
+  }
+
   send({ group, text, at, signal }) {
     return this.request('/send', {
       method: 'POST',

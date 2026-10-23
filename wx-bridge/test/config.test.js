@@ -21,6 +21,7 @@ function writeConfig(overrides = {}) {
     ...(Object.hasOwn(overrides, 'stickers') ? { stickers: overrides.stickers } : {}),
     ...(Object.hasOwn(overrides, 'vision') ? { vision: overrides.vision } : {}),
     ...(Object.hasOwn(overrides, 'proactive') ? { proactive: overrides.proactive } : {}),
+    ...(Object.hasOwn(overrides, 'tts') ? { tts: overrides.tts } : {}),
     stateDir: overrides.stateDir ?? 'state'
   };
   const file = path.join(dir, 'config.json');
@@ -184,6 +185,33 @@ test('proactive 默认关闭；配置写错或群没被监听时拒绝启动', (
     const bad = writeConfig({ proactive });
     try {
       assert.throws(() => loadConfig(bad.file), /proactive/, JSON.stringify(proactive));
+    } finally {
+      fs.rmSync(bad.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('tts 默认关闭；minimax 必须给 keyFile，字段写错就拒绝', () => {
+  const plain = writeConfig({});
+  try {
+    const cfg = loadConfig(plain.file);
+    assert.equal(cfg.tts.enabled, false);
+    assert.equal(cfg.tts.provider, 'minimax');
+    assert.equal(cfg.tts.voice, 'qiaopi_mengmei');
+  } finally {
+    fs.rmSync(plain.dir, { recursive: true, force: true });
+  }
+  const good = writeConfig({ tts: { enabled: true, keyFile: 'k.txt' } });
+  try {
+    assert.equal(loadConfig(good.file).tts.enabled, true);
+  } finally {
+    fs.rmSync(good.dir, { recursive: true, force: true });
+  }
+  for (const tts of [{ enabled: true }, { provider: 'azure' }, { maxChars: 0 }, { speed: 3 },
+    { pitch: 13 }, { enabled: 'yes' }, { typo: 1 }, null, []]) {
+    const bad = writeConfig({ tts });
+    try {
+      assert.throws(() => loadConfig(bad.file), /tts/, JSON.stringify(tts));
     } finally {
       fs.rmSync(bad.dir, { recursive: true, force: true });
     }

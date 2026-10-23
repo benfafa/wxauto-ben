@@ -29,6 +29,7 @@ if str(HERE.parent) not in sys.path:
 from collector.server import CollectorService  # noqa: E402
 from collector.backends.fake_backend import FakeBackend  # noqa: E402
 from collector.stickers import StickerCatalog  # noqa: E402
+from collector.tts import tts_from_file
 from collector.vision import vision_from_file  # noqa: E402
 
 
@@ -108,6 +109,7 @@ def main(argv=None):
         allow_inject=args.allow_inject and args.backend == "fake",
         stickers=stickers,
         vision=vision_from_file(args.config),
+        tts=tts_from_file(args.config),
     )
 
     stop = threading.Event()

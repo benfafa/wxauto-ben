@@ -4,6 +4,7 @@ import { normalizeStickers } from './stickers.js';
 import { normalizeVision } from './vision.js';
 import { normalizeProactive } from './proactive.js';
 import { normalizeConversation } from './conversation.js';
+import { normalizeTts } from './tts.js';
 
 const DEFAULTS = Object.freeze({
   wechat: {
@@ -214,6 +215,7 @@ export function loadConfig(file) {
     stateDir,
     stickers: normalizeStickers(raw.stickers, baseDir),
     vision: normalizeVision(raw.vision),
+    tts: normalizeTts(raw.tts),
     conversation: (() => {
       const conversation = normalizeConversation(raw.conversation);
       const unknown = conversation.groups.filter((name) => !groups.includes(name));

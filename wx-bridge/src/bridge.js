@@ -14,6 +14,7 @@ import { GroupMemory } from './memory.js';
 import { parseProactiveReply, parseStickerReply, refreshStickerIndex, shortlistStickers, stickerProtocol } from './stickers.js';
 import { buildProactivePrompt } from './proactive.js';
 import { ConversationTracker } from './conversation.js';
+import { wantsVoice } from './tts.js';
 import { RecentImages, validateImages } from './vision.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -506,6 +507,24 @@ export class Bridge {
       }
       return;
     }
+    // 明确要语音时先试语音；失败就退回文字，不让一条消息空着。
+    if (!proactiveTurn && this.cfg.tts?.enabled && wantsVoice(text)) {
+      try {
+        const voice = await this.collector.sendTts({ group, text: plain });
+        if (voice?.ok !== true) throw new Error('语音发送未确认');
+        this.lastSentByGroup.set(group, Date.now());
+        this.log.message({ direction: 'out', kind: 'voice', group, text: plain, replyTo: messageId });
+        this.log.activity({ type: 'voice-sent', group, sender: sender ?? null, messageId,
+          chars: plain.length, bytes: voice.bytes ?? null });
+        if (conversationTurn) this.conversations.countTurn(group, Date.now());
+        return;
+      } catch (error) {
+        this.log.warn(`语音回复失败，改发文字：群「${group}」：${error?.message ?? error}`);
+        this.log.activity({ type: 'voice-error', group, sender: sender ?? null, messageId,
+          error: String(error?.message ?? error) });
+      }
+    }
+
     const parts = splitMessage(plain, this.cfg.behavior.maxReplyChars);
     if (parts.length === 0) return;
 

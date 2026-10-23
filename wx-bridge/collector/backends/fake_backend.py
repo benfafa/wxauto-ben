@@ -62,6 +62,17 @@ class FakeBackend:
         self._record(record)
         return record
 
+    def send_file(self, group, filepath, *, what="文件"):
+        if group not in self.groups:
+            raise ValueError(f"group not allowed: {group}")
+        self._record({
+            "kind": "file",
+            "group": group,
+            "file": str(filepath),
+            "time": time.time(),
+        })
+        return {"ok": True, "delivered": True}
+
     def send_sticker(self, group, filepath, sticker_id):
         if group not in self.groups:
             raise ValueError(f"group not allowed: {group}")

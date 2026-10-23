@@ -12,8 +12,11 @@ const quietLogger = {
 
 function makeCollector() {
   const sent = [];
+  const tts = [];
   return {
     sent,
+    tts,
+    sendTts: async (payload) => { tts.push(payload); return { ok: true, bytes: 1024 }; },
     health: async () => ({ selfNickname: 'Bot', groups: ['群A'], backend: 'fake' }),
     cursor: async () => ({ collectorId: 'c1', cursor: 0 }),
     poll: async () => ({ collectorId: 'c1', cursor: 0, events: [] }),
@@ -40,9 +43,9 @@ function makeAgent(reply = '你好，我在。') {
 }
 
 function makeBridge({ agent = makeAgent(), collector = makeCollector(), behavior = {},
-  stickers, vision, proactive, conversation, groups = ['群A'], logger = quietLogger } = {}) {
+  stickers, vision, proactive, conversation, tts, groups = ['群A'], logger = quietLogger } = {}) {
   const cfg = {
-    stickers, vision, proactive, conversation,
+    stickers, vision, proactive, conversation, tts,
     wechat: {
       groups,
       mentionAliases: ['@小助手'],
@@ -463,4 +466,28 @@ test('conversation 关闭时不生效', async () => {
   await bridge.handleEvent({ group: '群A', sender: '张三', text: '不带@', id: 'c9', seq: 9 });
   await bridge.flush();
   assert.equal(agent.calls.length, before);
+});
+
+test('明确要语音时改发语音，不再发文字', async () => {
+  const collector = makeCollector();
+  const agent = makeAgent('哼，才不是为了你呢。');
+  const bridge = makeBridge({ tts: { enabled: true, keyFile: 'k' }, agent, collector }).bridge;
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '@小助手 用语音说一遍', id: 'v1', seq: 1 });
+  await bridge.flush();
+  assert.equal(collector.tts.length, 1);
+  assert.equal(collector.tts[0].group, '群A');
+  assert.equal(collector.tts[0].text, '哼，才不是为了你呢。');
+  assert.equal(collector.sent.length, 0, '语音回合不该再发一条文字');
+});
+
+test('语音失败时退回文字，不让消息空着', async () => {
+  const collector = makeCollector();
+  collector.sendTts = async () => { throw new Error('tts down'); };
+  const agent = makeAgent('退回去的文字');
+  const bridge = makeBridge({ tts: { enabled: true, keyFile: 'k' }, agent, collector }).bridge;
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '@小助手 发条语音', id: 'v2', seq: 1 });
+  await bridge.flush();
+  assert.equal(collector.tts.length, 0);
+  assert.equal(collector.sent.length, 1);
+  assert.equal(collector.sent[0].text, '退回去的文字');
 });
