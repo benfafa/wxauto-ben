@@ -40,9 +40,9 @@ function makeAgent(reply = '你好，我在。') {
 }
 
 function makeBridge({ agent = makeAgent(), collector = makeCollector(), behavior = {},
-  stickers, vision, groups = ['群A'], logger = quietLogger } = {}) {
+  stickers, vision, proactive, groups = ['群A'], logger = quietLogger } = {}) {
   const cfg = {
-    stickers, vision,
+    stickers, vision, proactive,
     wechat: {
       groups,
       mentionAliases: ['@小助手'],

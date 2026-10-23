@@ -63,6 +63,9 @@ python3 -m unittest discover -s collector/tests      # 11 项通过
 wx-bridge/
   src/                  Node 桥接
     bridge.js           主循环：白名单、@、去重、限速、上下文、发送
+    proactive.js        没人 @ 时的主动插话判定与提示词（默认关闭）
+    stickers.js         表情包白名单、索引粗筛与输出协议
+    vision.js           群图片元数据与内联图片校验
     dsh-agent.js        DSH 会话管理 + turn 文本收集 + 自动拒绝工具审批
     config.js           配置加载与 fail-closed 校验
     vendor/             vendored 自 qq-bridge 的 MIT DSH 客户端
@@ -308,6 +311,22 @@ collector 会再校验一次扩展名、magic、大小、真实路径和目录�
 | `maxBytes` | 单张原图上限 | `5242880` |
 
 图片只从 wxauto4 下载，落盘后立即清理；会剥离 EXIF、限制像素并重新编码。当前模型是否真的支持图片要看 DSH 的模型能力，缺失时按普通文本降级并提示。群图片属于敏感数据，启用前请自行评估。
+
+### proactive（可选，默认关闭）
+
+没人 @ 的时候，按概率主动接一句。默认档位是「保守」：只在群里确实有人刚聊、且离上次说话足够久时才摇号。
+
+| 字段 | 说明 | 默认 |
+| --- | --- | --- |
+| `enabled` | 是否允许主动插话 | `false` |
+| `chance` | 每条符合条件的群消息触发插话判定的概率（0~100，摇号在**所有**便宜闸门之后） | `12` |
+| `minIntervalMs` | 同群两次主动插话的最小间隔，也是「刚回过别人」后的静默期（60000~3600000） | `360000` |
+| `maxPerHour` | 同群每小时最多主动说几次（1~20） | `3` |
+| `activityWindowMs` | 多久内必须有人说过话（10000~600000） | `120000` |
+| `minRecentMessages` | 上述窗口内至少几条群友消息（1~20） | `2` |
+| `groups` | 只在这些群里允许插话；空数组表示所有监听群 | `[]` |
+
+行为要点：主动回合不 @ 任何人；提示词把「沉默」设成默认答案，模型返回空 `text` 就什么都不发；只有严格按 `{"text":"...","stickerId":...}` 协议返回且 `text` 非空才会发送——散文、坏 JSON、多余字段一律当沉默，绝不把提示词或控制串漏进群。主动回合同样可以按语境带一张表情（走同一份白名单与索引）。`state/activity.jsonl` 里会看到 `proactive-trigger` / `proactive-sent` / `proactive-declined` / `proactive-skip`（`reason` 为 `chance` 或 `hourly-cap`），用来回看它为什么说话或为什么憋住。自己发的消息不计入活跃度，有 @ 回合在排队或正在处理时也不会插队。
 
 ### stateDir
 

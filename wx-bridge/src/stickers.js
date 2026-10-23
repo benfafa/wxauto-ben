@@ -327,16 +327,39 @@ function safeText(text) {
   return typeof text === 'string' && !/[{}]|stickerId|```|^\s*[\["]/iu.test(text) ? text.trim() : '';
 }
 
-export function parseStickerReply(raw, stickers) {
-  const source = typeof raw === 'string' ? raw.trim() : '';
-  const fallback = { text: safeText(source), stickerId: null };
+// Three outcomes, deliberately distinguishable: not JSON at all (null), JSON but
+// the wrong shape ({bad:true}), and a usable control object.
+function parseControl(source) {
   let value;
-  try { value = JSON.parse(source); } catch { return fallback; }
+  try { value = JSON.parse(source); } catch { return null; }
   if (!value || typeof value !== 'object' || Array.isArray(value)
       || Object.keys(value).length !== 2 || !Object.hasOwn(value, 'text') || !Object.hasOwn(value, 'stickerId')) {
-    return { text: '', stickerId: null };
+    return { bad: true };
   }
-  const text = safeText(value.text);
-  const allowed = stickers?.enabled && stickers.items?.some((item) => item.id === value.stickerId);
-  return { text, stickerId: text && allowed && typeof value.stickerId === 'string' ? value.stickerId : null };
+  return value;
+}
+
+function allowedStickerId(stickers, rawId) {
+  return stickers?.enabled && typeof rawId === 'string'
+    && stickers.items?.some((item) => item.id === rawId) ? rawId : null;
+}
+
+export function parseStickerReply(raw, stickers) {
+  const source = typeof raw === 'string' ? raw.trim() : '';
+  const control = parseControl(source);
+  if (control === null) return { text: safeText(source), stickerId: null };
+  if (control.bad) return { text: '', stickerId: null };
+  const text = safeText(control.text);
+  return { text, stickerId: text ? allowedStickerId(stickers, control.stickerId) : null };
+}
+
+/**
+ * 主动插话用更严的口径：只有按协议返回、且确实写了内容才算「想说话」。
+ * 散文、跑题、坏 JSON 一律当成沉默——宁可少说，不可胡接。
+ */
+export function parseProactiveReply(raw, stickers) {
+  const control = parseControl(typeof raw === 'string' ? raw.trim() : '');
+  const text = control && !control.bad ? safeText(control.text) : '';
+  if (!text) return { text: '', stickerId: null, declined: true };
+  return { text, stickerId: allowedStickerId(stickers, control.stickerId), declined: false };
 }

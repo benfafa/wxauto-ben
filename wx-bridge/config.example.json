@@ -60,5 +60,14 @@
     "maxImages": 2,
     "maxBytes": 5242880
   },
-  "stateDir": "state"
+  "stateDir": "state",
+  "proactive": {
+    "enabled": false,
+    "chance": 12,
+    "minIntervalMs": 360000,
+    "maxPerHour": 3,
+    "activityWindowMs": 120000,
+    "minRecentMessages": 2,
+    "groups": []
+  }
 }

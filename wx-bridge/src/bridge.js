@@ -11,7 +11,8 @@ import { sanitizeOutgoing, splitMessage } from './reply.js';
 import { truncateText } from './text.js';
 import { Semaphore } from './semaphore.js';
 import { GroupMemory } from './memory.js';
-import { parseStickerReply, refreshStickerIndex, shortlistStickers, stickerProtocol } from './stickers.js';
+import { parseProactiveReply, parseStickerReply, refreshStickerIndex, shortlistStickers, stickerProtocol } from './stickers.js';
+import { buildProactivePrompt } from './proactive.js';
 import { RecentImages, validateImages } from './vision.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -85,6 +86,14 @@ export class Bridge {
     this.lastAcceptedByGroup = new Map();
     this.lastSentByGroup = new Map();
     this.images = new RecentImages(cfg.vision);
+    // 主动插话：默认关闭（测试里没配 proactive 也要能跑）。
+    this.proactive = cfg.proactive ?? { enabled: false, groups: [] };
+    this.selfNames = new Set((cfg.wechat?.mentionAliases ?? [])
+      .map((alias) => String(alias).replace(/^@+/, '').trim()).filter(Boolean));
+    this.recentInbound = new Map();
+    this.lastInboundText = new Map();
+    this.lastProactiveAt = new Map();
+    this.proactiveTimes = [];
     this.replyTimes = [];
     this.semaphore = new Semaphore(cfg.behavior.globalConcurrency);
     this.stopping = false;
@@ -197,7 +206,19 @@ export class Bridge {
     ]);
   }
 
+  /** 一条群消息进来：先按常规处理，再判断要不要主动插一句。 */
   async handleEvent(event) {
+    await this.#handleInbound(event);
+    if (event?.group) {
+      try {
+        await this.#maybeProactive(event.group);
+      } catch (error) {
+        this.log.error(`主动插话判定失败：群「${event.group}」：${error?.message ?? error}`);
+      }
+    }
+  }
+
+  async #handleInbound(event) {
     if (!event || typeof event !== 'object') return;
     const group = String(event.group ?? '').trim();
     if (!this.allowedGroups.has(group)) return;
@@ -238,6 +259,10 @@ export class Bridge {
 
     this.context.add({ id: messageId, group, sender, text: rawText, atMe: mentioned });
     this.memory.add({ group, id: messageId, sender, text: rawText, atMe: mentioned, timestamp: event.timestamp });
+    if (!this.selfNames.has(sender)) {
+      this.#noteActivity(group, now);
+      this.lastInboundText.set(group, rawText);
+    }
     if (this.cfg.behavior.logAllMessages) {
       this.log.message({
         direction: 'in',
@@ -303,6 +328,65 @@ export class Bridge {
     this.chains.set(group, next);
   }
 
+  #noteActivity(group, at) {
+    const window = this.proactive?.activityWindowMs ?? 120000;
+    const list = (this.recentInbound.get(group) ?? []).filter((time) => at - time <= window);
+    list.push(at);
+    this.recentInbound.set(group, list.slice(-20));
+  }
+
+  /**
+   * 没人 @ 也要不要说一句。所有闸门都是「先便宜后贵」：先查状态，
+   * 最后才摇号，避免每条消息都白烧一次模型调用。
+   */
+  async #maybeProactive(group) {
+    const cfg = this.proactive;
+    if (!cfg?.enabled || this.stopping) return;
+    if (cfg.groups.length && !cfg.groups.includes(group)) return;
+    // 有 @ 回合在排队或正在处理，就别插队了。
+    if (this.chains.has(group) || (this.queueSizes.get(group) ?? 0) > 0) return;
+
+    const now = Date.now();
+    const recent = (this.recentInbound.get(group) ?? []).filter((time) => now - time <= cfg.activityWindowMs);
+    this.recentInbound.set(group, recent);
+    if (recent.length < cfg.minRecentMessages) return;
+    if (now - (this.lastProactiveAt.get(group) ?? 0) < cfg.minIntervalMs) return;
+    if (now - (this.lastSentByGroup.get(group) ?? 0) < cfg.minIntervalMs) return;
+
+    this.proactiveTimes = this.proactiveTimes.filter((time) => now - time < 3_600_000);
+    if (this.proactiveTimes.length >= cfg.maxPerHour) {
+      this.log.activity({ type: 'proactive-skip', group, reason: 'hourly-cap' });
+      return;
+    }
+    const roll = Math.random() * 100;
+    if (roll >= cfg.chance) {
+      this.log.activity({ type: 'proactive-skip', group, reason: 'chance', roll: Math.round(roll), chance: cfg.chance });
+      return;
+    }
+
+    this.lastProactiveAt.set(group, now);
+    this.proactiveTimes.push(now);
+    const job = {
+      group,
+      sender: null,
+      text: '（没人 @ 你，这是主动插话回合）',
+      images: [],
+      messageId: `proactive-${now}`,
+      receivedAt: now,
+      proactive: true,
+      memoryQuery: this.lastInboundText.get(group) ?? ''
+    };
+    this.log.activity({ type: 'proactive-trigger', group, recent: recent.length });
+    const previous = this.chains.get(group) ?? Promise.resolve();
+    const next = previous
+      .then(() => this.#processTrigger(job))
+      .catch((error) => this.log.error(`主动插话回合失败：群「${group}」：${error?.message ?? error}`))
+      .finally(() => {
+        if (this.chains.get(group) === next) this.chains.delete(group);
+      });
+    this.chains.set(group, next);
+  }
+
   #pruneDedup(now) {
     if (this.seenIds.size < 4000) return;
     const cutoff = now - 10 * 60_000;
@@ -336,7 +420,7 @@ export class Bridge {
         return;
       }
       const context = this.context.formatPrevious(group, messageId);
-      const memory = this.memory.search(group, text);
+      const memory = this.memory.search(group, job.memoryQuery ?? text);
       let images = [];
       try {
         for (const candidate of job.images) {
@@ -357,9 +441,13 @@ export class Bridge {
         if (refreshStickerIndex(this.cfg.stickers)) {
           this.log.info(`表情包标签索引已热更新：${this.cfg.stickers.items.length} 张可用`);
         }
-        const prompt = buildPrompt({ group, sender, text, context, memory,
-          stickers: this.cfg.stickers, vision: this.cfg.vision, images: job.images });
-        this.log.info(`调用 agent：群「${group}」 ${sender}：${truncateText(text, 80)}`);
+        const proactiveTurn = job.proactive === true;
+        const prompt = proactiveTurn
+          ? buildProactivePrompt({ group, context, memory, stickers: this.cfg.stickers })
+          : buildPrompt({ group, sender, text, context, memory,
+            stickers: this.cfg.stickers, vision: this.cfg.vision, images: job.images });
+        this.log.info(proactiveTurn ? `主动插话回合：群「${group}」`
+          : `调用 agent：群「${group}」 ${sender}：${truncateText(text, 80)}`);
         result = await this.agent.ask(group, prompt, { images });
       }
     } catch (error) {
@@ -379,10 +467,17 @@ export class Bridge {
       this.semaphore.release();
     }
 
-    const parsed = parseStickerReply(result.text, this.cfg.stickers);
+    const proactiveTurn = job.proactive === true;
+    const parsed = proactiveTurn ? parseProactiveReply(result.text, this.cfg.stickers)
+      : parseStickerReply(result.text, this.cfg.stickers);
     const plain = sanitizeOutgoing(parsed.text);
     if (!plain) {
-      this.log.warn(`agent 返回了空回复：群「${group}」`);
+      if (proactiveTurn) {
+        // 模型选择闭嘴是正常结果，不是错误。
+        this.log.activity({ type: 'proactive-declined', group, sender });
+      } else {
+        this.log.warn(`agent 返回了空回复：群「${group}」`);
+      }
       return;
     }
     const parts = splitMessage(plain, this.cfg.behavior.maxReplyChars);
@@ -390,7 +485,8 @@ export class Bridge {
 
     let sent = 0;
     for (let i = 0; i < parts.length; i += 1) {
-      const at = i === 0 && this.cfg.behavior.replyWithMention ? sender : null;
+      // 主动插话不 @ 任何人，否则比话痨更招人烦。
+      const at = !proactiveTurn && i === 0 && this.cfg.behavior.replyWithMention ? sender : null;
       const ok = await this.#safeSend(group, at, parts[i]);
       if (!ok) break;
       sent += 1;
@@ -401,10 +497,12 @@ export class Bridge {
     }
     if (sent > 0) {
       this.lastSentByGroup.set(group, Date.now());
-      this.log.info(`已回复群「${group}」 ${sender}：${sent} 段，共 ${plain.length} 字`);
-      this.log.activity({ type: 'reply', group, sender, messageId, parts: sent, chars: plain.length });
+      this.log.info(proactiveTurn ? `主动插话群「${group}」：${sent} 段，共 ${plain.length} 字`
+        : `已回复群「${group}」 ${sender}：${sent} 段，共 ${plain.length} 字`);
+      this.log.activity({ type: proactiveTurn ? 'proactive-sent' : 'reply', group, sender: sender ?? null,
+        messageId, parts: sent, chars: plain.length });
     }
-    if (sent === parts.length) await this.#sendSticker({ ...job, stickerId: parsed.stickerId });
+    if (sent > 0 && sent === parts.length) await this.#sendSticker({ ...job, stickerId: parsed.stickerId });
   }
 
   async #sendSticker({ group, stickerId, messageId }) {

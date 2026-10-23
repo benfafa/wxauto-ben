@@ -20,6 +20,7 @@ function writeConfig(overrides = {}) {
     behavior: { ...(overrides.behavior ?? {}) },
     ...(Object.hasOwn(overrides, 'stickers') ? { stickers: overrides.stickers } : {}),
     ...(Object.hasOwn(overrides, 'vision') ? { vision: overrides.vision } : {}),
+    ...(Object.hasOwn(overrides, 'proactive') ? { proactive: overrides.proactive } : {}),
     stateDir: overrides.stateDir ?? 'state'
   };
   const file = path.join(dir, 'config.json');
@@ -156,6 +157,35 @@ test('rejects malformed sticker configuration even when disabled', () => {
       assert.throws(() => loadConfig(file), /stickers/, JSON.stringify(stickers));
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('proactive 默认关闭；配置写错或群没被监听时拒绝启动', () => {
+  const plain = writeConfig({});
+  try {
+    const cfg = loadConfig(plain.file);
+    assert.equal(cfg.proactive.enabled, false);
+    assert.equal(cfg.proactive.chance, 12);
+    assert.equal(cfg.proactive.maxPerHour, 3);
+    assert.deepEqual(cfg.proactive.groups, []);
+  } finally {
+    fs.rmSync(plain.dir, { recursive: true, force: true });
+  }
+  const good = writeConfig({ proactive: { enabled: true, chance: 30, groups: ['群A'] } });
+  try {
+    assert.equal(loadConfig(good.file).proactive.chance, 30);
+  } finally {
+    fs.rmSync(good.dir, { recursive: true, force: true });
+  }
+  for (const proactive of [{ enabled: true, groups: ['没监听的群'] }, { chance: 101 }, { chance: -1 },
+    { maxPerHour: 0 }, { minIntervalMs: 1000 }, { activityWindowMs: 100 }, { minRecentMessages: 0 },
+    { typo: 1 }, { groups: [1] }, { enabled: 'true' }, null, []]) {
+    const bad = writeConfig({ proactive });
+    try {
+      assert.throws(() => loadConfig(bad.file), /proactive/, JSON.stringify(proactive));
+    } finally {
+      fs.rmSync(bad.dir, { recursive: true, force: true });
     }
   }
 });
