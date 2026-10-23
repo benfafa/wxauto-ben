@@ -96,18 +96,32 @@ function processAlive(pid) {
 export function acquireInstanceLock(stateDir) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const file = path.join(stateDir, 'bridge.lock');
-  try {
-    const existing = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (existing?.pid !== process.pid && processAlive(Number(existing?.pid))) {
-      throw new Error(`已有 wx-bridge 实例在运行（pid ${existing.pid}）；请先停止它，或确认进程已退出后删除 ${file}`);
-    }
-  } catch (error) {
-    if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
-    if (error instanceof SyntaxError) {
-      // 损坏的锁文件不能当作“已加锁”；继续覆盖，避免用户被一个坏文件永久挡住。
+  const content = `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2)}\n`;
+  for (;;) {
+    try {
+      // wx makes the ownership claim atomic, avoiding two bridges passing a
+      // read-then-write race at startup.
+      fs.writeFileSync(file, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      let existing;
+      try {
+        existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+      } catch (readError) {
+        if (readError?.code !== 'ENOENT') {
+          // A damaged lock cannot prove that another process owns the lock;
+          // remove it and retry the atomic claim.
+          fs.rmSync(file, { force: true });
+        }
+        continue;
+      }
+      if (existing?.pid !== process.pid && processAlive(Number(existing?.pid))) {
+        throw new Error(`已有 wx-bridge 实例在运行（pid ${existing.pid}）；请先停止它，或确认进程已退出后删除 ${file}`);
+      }
+      fs.rmSync(file, { force: true });
     }
   }
-  atomicWrite(file, `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2)}\n`);
   let released = false;
   return {
     file,

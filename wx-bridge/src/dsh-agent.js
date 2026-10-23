@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { validateImages } from './vision.js';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './vendor/dsh-client.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -188,6 +189,7 @@ export class DshAgent {
         if (attempt < 2) await sleep(500);
       }
     }
+    if (this.cfg.vision?.enabled) throw new Error('vision 已启用但配置模型设置失败；拒绝切换默认模型');
     this.log.warn(`设置会话模型失败，将使用 DSH 默认模型：${lastError?.message ?? lastError}`);
     return 'failed';
   }
@@ -255,7 +257,7 @@ export class DshAgent {
         this.log.warn('DSH 事件流已结束；准备重连');
       } catch (error) {
         if (this.abort.signal.aborted) break;
-        this.lastStreamError = String(error?.message ?? error);
+        this.lastStreamError = this.cfg.vision?.enabled ? 'vision 事件流中断（省略上游内容）' : String(error?.message ?? error);
         this.log.warn(`DSH 事件流中断：${this.lastStreamError}`);
       }
       this.streamReady = false;
@@ -295,11 +297,11 @@ export class DshAgent {
       return;
     }
     if (frame.type === 'stream/error') {
-      this.log.warn(`DSH 会话流错误：${JSON.stringify(frame.error)}`);
+      this.log.warn(this.cfg.vision?.enabled ? 'DSH 会话流错误（vision 已启用，省略上游内容）' : `DSH 会话流错误：${JSON.stringify(frame.error)}`);
     }
   }
 
-  async #promptAndWait(group, sessionId, prompt) {
+  async #promptAndWait(group, sessionId, prompt, images) {
     if (this.stopping) throw new Error('bridge stopping');
     await this.#waitStreamReady(60000);
     if (this.stopping) throw new Error('bridge stopping');
@@ -318,10 +320,10 @@ export class DshAgent {
         accepted = await this.api.sessions.prompt({
           sessionId,
           mode: 'queue',
-          content: [{ type: 'text', text: prompt }]
+          content: [{ type: 'text', text: prompt }, ...images]
         });
       } catch (error) {
-        if (isNotFound(error)) {
+        if (!waiter.collector && /session\/not-found/i.test(String(error?.message ?? error))) {
           this.modelApplied.delete(sessionId);
           throw Object.assign(new Error(`DSH 会话 ${sessionId} 不存在：${error?.message ?? error}`), { sessionGone: true, group });
         }
@@ -330,7 +332,7 @@ export class DshAgent {
       if (!accepted?.result?.ok) {
         const code = accepted?.result?.error?.code ?? 'unknown';
         const message = accepted?.result?.error?.message ?? 'unknown error';
-        if (/not[- ]?found/i.test(code) || /not[- ]?found/i.test(message)) {
+        if (!waiter.collector && code === 'session/not-found') {
           this.modelApplied.delete(sessionId);
           throw Object.assign(new Error(`DSH 会话 ${sessionId} 不存在：${code}: ${message}`), { sessionGone: true, group });
         }
@@ -347,16 +349,17 @@ export class DshAgent {
    * 向群对应的 DSH 会话投递一条 prompt，并等待该回合的最终文本。
    * 只有“会话不存在”会在重建后重试一次；回合中途失败不重试，避免重复回复。
    */
-  async ask(group, prompt) {
+  async ask(group, prompt, { images = [] } = {}) {
+    const content = validateImages(images, this.cfg.vision);
     const sessionId = await this.ensureSession(group);
     try {
-      return await this.#promptAndWait(group, sessionId, prompt);
+      return await this.#promptAndWait(group, sessionId, prompt, content);
     } catch (error) {
       if (!error?.sessionGone) throw error;
       this.log.warn(`会话丢失，重建后重试一次：群「${group}」`);
       this.store.remove(group);
       const recreated = await this.ensureSession(group);
-      return this.#promptAndWait(group, recreated, prompt);
+      return this.#promptAndWait(group, recreated, prompt, content);
     }
   }
 }

@@ -23,6 +23,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from collector.stickers import StickerCatalog, StickerError
+from collector.vision import ImageCache
+
 
 MAX_EVENTS = 5000
 MAX_BODY = 64 * 1024
@@ -50,9 +53,23 @@ class SendJob:
     future: Future
 
 
+@dataclass
+class StickerJob:
+    group: str
+    sticker_id: str
+    future: Future
+
+
+@dataclass
+class ImageJob:
+    group: str
+    image_id: str
+    future: Future
+
+
 class CollectorService:
     def __init__(self, backend, token, *, allowed_groups=None, poll_ms=800,
-                 host="127.0.0.1", port=0, allow_inject=False):
+                 host="127.0.0.1", port=0, allow_inject=False, stickers=None, vision=None):
         if not token:
             raise ValueError("collector token 不能为空")
         # backend 可以是实例（fake/测试），也可以是工厂函数（wxauto 必须在 UI 线程里构造，
@@ -72,6 +89,8 @@ class CollectorService:
         self.host = host
         self.port = int(port)
         self.allow_inject = allow_inject
+        self.stickers = stickers if stickers is not None else StickerCatalog()
+        self.images = ImageCache(vision)
 
         self.collector_id = uuid.uuid4().hex
         self._events = deque(maxlen=MAX_EVENTS)
@@ -129,27 +148,54 @@ class CollectorService:
         return self._backend_init_error
 
     def _ui_loop(self):
-        if self.backend is None:
-            try:
-                self.backend = self._backend_source() if callable(self._backend_source) else self._backend_source
-            except Exception as error:
-                self._backend_init_error = f"{type(error).__name__}: {error}"
-                logging.exception("backend init failed")
+        comtypes = None
+        try:
+            # wxauto4 uses COM UI Automation. Explicitly initialize the
+            # worker apartment; constructing it without this works on the
+            # main thread but fails here with RPC_E_CALL_REJECTED-like errors.
+            import comtypes as _comtypes
+            comtypes = _comtypes
+            comtypes.CoInitialize()
+        except ImportError:
+            pass
+        try:
+            if self.backend is None:
+                try:
+                    self.backend = self._backend_source() if callable(self._backend_source) else self._backend_source
+                except Exception as error:
+                    self._backend_init_error = f"{type(error).__name__}: {error}"
+                    logging.exception("backend init failed")
+                    self._backend_ready.set()
+                    return
                 self._backend_ready.set()
-                return
-            self._backend_ready.set()
-        while not self._stop.is_set():
-            try:
-                job = self._jobs.get(timeout=self.poll_ms / 1000)
-            except queue.Empty:
-                self._poll_once()
-                continue
-            if job is None:
-                break
-            if isinstance(job, SendJob):
-                self._handle_send(job)
+            self.backend.vision_enabled = self.images.config["enabled"]
+            if self.backend.vision_enabled and getattr(self.backend, "mode", "") == "legacy":
+                logging.warning("legacy backend does not support image download; vision will degrade to text")
+            while not self._stop.is_set():
+                try:
+                    job = self._jobs.get(timeout=self.poll_ms / 1000)
+                except queue.Empty:
+                    self._poll_once()
+                    continue
+                if job is None:
+                    break
+                if isinstance(job, ImageJob):
+                    if job.future.set_running_or_notify_cancel():
+                        try:
+                            job.future.set_result(self.images.get(job.group, job.image_id))
+                        except Exception:
+                            # Do not expose paths, downloaded bytes or backend exception data.
+                            logging.warning("image retrieval failed: group=%s imageId=%s", job.group, job.image_id)
+                            job.future.set_exception(ValueError("image-unavailable: 未能读取图片"))
+                elif isinstance(job, (SendJob, StickerJob)):
+                    self._handle_send(job)
+        finally:
+            self.images.close()
+            if comtypes is not None:
+                comtypes.CoUninitialize()
 
     def _poll_once(self):
+        self.images.prune()
         try:
             messages = self.backend.poll()
         except Exception as error:
@@ -161,6 +207,12 @@ class CollectorService:
             with self._condition:
                 for message in messages:
                     event = dict(message)
+                    image_message = event.pop("_imageMessage", None)
+                    event.pop("imageId", None)
+                    if event.get("group") not in self.allowed_groups:
+                        continue
+                    if self.images.config["enabled"] and event.get("kind") == "image":
+                        event["imageId"] = self.images.register(event["group"], image_message)
                     event.setdefault("id", f"event-{uuid.uuid4().hex}")
                     event["seq"] = self._next_seq
                     self._next_seq += 1
@@ -172,16 +224,27 @@ class CollectorService:
         self._last_error = None
 
     def _handle_send(self, job):
-        if job.future.cancelled():
+        if not job.future.set_running_or_notify_cancel():
             logging.warning("send job expired before the UI worker started: group=%s", job.group)
             return
+        sticker_id = job.sticker_id if isinstance(job, StickerJob) else None
         try:
-            result = self.backend.send(job.group, job.text, job.at)
+            if isinstance(job, StickerJob):
+                file = self.stickers.validate(sticker_id)
+                result = self.backend.send_sticker(job.group, str(file), sticker_id)
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    raise RuntimeError("sticker send was not confirmed")
+                logging.info("sticker sent: group=%s stickerId=%s", job.group, sticker_id)
+                result = {"ok": True, "stickerId": sticker_id}
+            else:
+                result = self.backend.send(job.group, job.text, job.at)
+            if result is False or (isinstance(result, dict) and result.get("ok") is False):
+                raise RuntimeError("backend reported send failure")
             with self._lock:
                 self._send_count += 1
             job.future.set_result(result or {"ok": True})
         except Exception as error:
-            logging.exception("backend send failed: group=%s", job.group)
+            logging.exception("backend send failed: group=%s stickerId=%s", job.group, sticker_id)
             job.future.set_exception(error)
 
     # ── API operations ───────────────────────────────────────────
@@ -260,14 +323,42 @@ class CollectorService:
             raise ApiError(400, "text-too-long", f"text 最多 {MAX_TEXT} 个字符")
         if at and len(at) > 100:
             raise ApiError(400, "at-too-long", "@ 对象过长")
-        future = Future()
-        self._jobs.put(SendJob(group=group, text=text, at=at, future=future))
+        return self._submit_send(SendJob(group=group, text=text, at=at, future=Future()))
+
+    def send_sticker(self, group, sticker_id):
+        group = str(group or "").strip()
+        if group not in self.allowed_groups:
+            raise ApiError(403, "group-not-allowed", f"群不在白名单：{group}")
+        self.stickers.validate(sticker_id)
+        if self.backend is None:
+            raise ApiError(503, "backend-not-ready", self._backend_init_error or "backend starting")
+        return self._submit_send(StickerJob(group=group, sticker_id=sticker_id, future=Future()))
+
+    def image(self, group, image_id):
+        if not isinstance(group, str) or group not in self.allowed_groups:
+            raise ApiError(403, "group-not-allowed", "群不在白名单")
+        if not self.images.config["enabled"]:
+            raise ApiError(403, "vision-disabled", "图片采集未启用")
+        if not isinstance(image_id, str) or len(image_id) != 32 or any(c not in "0123456789abcdef" for c in image_id):
+            raise ApiError(400, "invalid-image-id", "imageId 格式非法")
+        if self.backend is None:
+            raise ApiError(503, "backend-not-ready", "backend starting")
+        return self._submit_send(ImageJob(group, image_id, Future()))
+
+    def _submit_send(self, job):
+        self._jobs.put(job)
         try:
-            return future.result(timeout=45)
+            return job.future.result(timeout=45)
         except FutureTimeout:
-            future.cancel()
+            job.future.cancel()
+            if isinstance(job, ImageJob):
+                raise ApiError(504, "image-timeout", "等待微信 UI 图片下载超时")
             raise ApiError(504, "send-timeout", "等待微信 UI 发送超时")
+        except StickerError:
+            raise
         except ValueError as error:
+            if isinstance(job, ImageJob):
+                raise ApiError(400, "image-unavailable", "未能读取图片")
             raise ApiError(400, "send-rejected", str(error))
         except Exception as error:
             raise ApiError(500, "send-failed", f"{type(error).__name__}: {error}")
@@ -318,7 +409,7 @@ class CollectorService:
                     pass
 
             def _error(self, error):
-                if isinstance(error, ApiError):
+                if isinstance(error, (ApiError, StickerError)):
                     self._send_json(error.status, {"ok": False, "code": error.code, "error": str(error)})
                 else:
                     logging.exception("unhandled collector error")
@@ -384,6 +475,19 @@ class CollectorService:
                         body = self._read_json()
                         result = service.send(body.get("group"), body.get("text"), body.get("at"))
                         self._send_json(200, {"ok": True, **(result or {})})
+                        return
+                    if parsed.path == "/image":
+                        body = self._read_json()
+                        if set(body) != {"group", "imageId"}:
+                            raise ApiError(400, "bad-image-body", "仅允许 group 和 imageId")
+                        self._send_json(200, service.image(body["group"], body["imageId"]))
+                        return
+                    if parsed.path == "/send-sticker":
+                        body = self._read_json()
+                        if set(body) != {"group", "stickerId"}:
+                            raise ApiError(400, "bad-sticker-body", "仅允许 group 和 stickerId")
+                        result = service.send_sticker(body["group"], body["stickerId"])
+                        self._send_json(200, result)
                         return
                     if parsed.path == "/inject":
                         body = self._read_json()

@@ -6,3 +6,4 @@ pyperclip>=1.8
 pillow>=9.0
 psutil>=5.9
 colorama>=0.4
+wxauto4>=41.1.7

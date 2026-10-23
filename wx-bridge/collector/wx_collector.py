@@ -28,6 +28,8 @@ if str(HERE.parent) not in sys.path:
 
 from collector.server import CollectorService  # noqa: E402
 from collector.backends.fake_backend import FakeBackend  # noqa: E402
+from collector.stickers import StickerCatalog  # noqa: E402
+from collector.vision import vision_from_file  # noqa: E402
 
 
 def load_wechat_config(path):
@@ -64,6 +66,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     wechat = load_wechat_config(args.config)
+    stickers = StickerCatalog.from_config_file(args.config)
     collector_url = str(wechat.get("collectorUrl") or "http://127.0.0.1:8765")
     parsed = urlparse(collector_url)
     port = args.port if args.port is not None else (parsed.port or 8765)
@@ -103,6 +106,8 @@ def main(argv=None):
         host=args.host,
         port=port,
         allow_inject=args.allow_inject and args.backend == "fake",
+        stickers=stickers,
+        vision=vision_from_file(args.config),
     )
 
     stop = threading.Event()

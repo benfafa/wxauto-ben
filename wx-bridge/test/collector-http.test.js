@@ -36,11 +36,31 @@ function waitForUrl(child, timeoutMs = 10000) {
   });
 }
 
+test('image HTTP client rejects oversized responses and refuses redirects', async (t) => {
+  let options;
+  t.mock.method(globalThis, 'fetch', async (_url, opts) => {
+    options = opts;
+    return new Response('x', { headers: { 'content-length': '999999999' } });
+  });
+  const client = new CollectorClient({ baseUrl: 'http://127.0.0.1:8765', token: TOKEN });
+  await assert.rejects(client.image({ group: 'A', imageId: 'a'.repeat(32) }), /响应过大/);
+  assert.equal(options.redirect, 'error');
+  assert.deepEqual(JSON.parse(options.body), { group: 'A', imageId: 'a'.repeat(32) });
+});
+
 test('Node CollectorClient talks to the real Python fake collector', { timeout: 20000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-bridge-collector-'));
   const sendLog = path.join(dir, 'sent.jsonl');
+  const configFile = path.join(dir, 'config.json');
+  fs.mkdirSync(path.join(dir, 'stickers'));
+  fs.writeFileSync(path.join(dir, 'stickers', 'happy.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+  fs.writeFileSync(configFile, JSON.stringify({ stickers: {
+    enabled: true, directory: 'stickers', cooldownMs: 60000,
+    items: [{ id: 'happy', file: 'happy.png', keywords: ['开心'] }]
+  }, vision: { enabled: true } }));
   const child = spawn(PYTHON, [
     '-m', 'collector.wx_collector',
+    '--config', configFile,
     '--backend', 'fake',
     '--groups', '测试群',
     '--token', TOKEN,
@@ -49,7 +69,7 @@ test('Node CollectorClient talks to the real Python fake collector', { timeout: 
     '--send-log', sendLog
   ], {
     cwd: ROOT,
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
@@ -82,6 +102,31 @@ test('Node CollectorClient talks to the real Python fake collector', { timeout: 
     assert.equal(sent.group, '测试群');
     assert.equal(sent.text, '你好');
     assert.equal(sent.at, '张三');
+
+    const sticker = await client.sendSticker({ group: '测试群', stickerId: 'happy', file: 'must-not-be-transmitted' });
+    assert.deepEqual(sticker, { ok: true, stickerId: 'happy' });
+    const records = fs.readFileSync(sendLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(records.length, 2);
+    assert.equal(records[1].kind, 'sticker');
+    assert.equal(records[1].stickerId, 'happy');
+    assert.equal(records[1].file, fs.realpathSync(path.join(dir, 'stickers', 'happy.png')));
+    await assert.rejects(client.sendSticker({ group: '测试群', stickerId: 'unknown' }), { code: 'unknown-sticker' });
+    await assert.rejects(client.request('/send-sticker', {
+      method: 'POST', body: { group: '测试群', stickerId: 'happy', file: '/arbitrary.png' }
+    }), { code: 'bad-sticker-body' });
+    fs.writeFileSync(path.join(dir, 'stickers', 'happy.png'), 'not an image');
+    await assert.rejects(client.sendSticker({ group: '测试群', stickerId: 'happy' }), { code: 'invalid-sticker-file' });
+    await client.request('/inject', { method: 'POST', body: { group: '测试群', sender: '张三', text: '[图片]', kind: 'image' } });
+    const imageEvent = (await client.poll({ since: polled.cursor, waitMs: 3000 })).events[0];
+    assert.match(imageEvent.imageId, /^[a-f0-9]{32}$/);
+    assert.equal(imageEvent.data, undefined);
+    const image = await client.image({ group: '测试群', imageId: imageEvent.imageId, file: '/must-not-be-transmitted' });
+    assert.equal(image.mediaType, 'image/jpeg');
+    assert.ok(Buffer.from(image.data, 'base64').length > 0);
+    const unauthorized = new CollectorClient({ baseUrl: url, token: 'bad' });
+    await assert.rejects(unauthorized.image({ group: '测试群', imageId: imageEvent.imageId }), { status: 401 });
+    await assert.rejects(client.request('/image', { method: 'POST', body: { group: '测试群', imageId: imageEvent.imageId, path: 'evil' } }), { code: 'bad-image-body' });
+    assert.ok(!fs.readFileSync(sendLog, 'utf8').includes(image.data));
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM');

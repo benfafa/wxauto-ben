@@ -15,6 +15,7 @@ wx-bridge（Node，本目录 src/）
   ├─ 群白名单 + @ 检测 + 去重 + 限速
   ├─ 每个群一个 DSH 会话（state/sessions.json）
   ├─ 最近群聊上下文
+  ├─ 每群长期记忆（本地 memory.jsonl，按当前消息检索）
   └─ 调用 DSH Web API，收 turn 文本
         │
         ▼
@@ -71,6 +72,10 @@ wx-bridge/
     backends/           wxauto 后端 / fake 后端
   preset/wx-chat.preset.yml   DSH 无工具 preset
   scripts/install-preset.mjs  写入 DSH profile 的 cordis.patch.yml
+  scripts/check-vision.mjs    验证 DSH 是否真能读图（一条命令一次探针）
+  scripts/label-stickers-minimax.py  本地 MiniMax 视觉打标，产出 sticker-index.json
+  scripts/build-sticker-library.py   按标签整理可部署曲库（过滤不安全/被拒审/命中剔除词）
+  scripts/caption-stickers.mjs       在服务器上用 DSH 打标的备选实现
   test/                 Node 测试
   collector/tests/      Python 测试
   config.example.json
@@ -264,8 +269,45 @@ wxauto 3.9 不提供结构化的 at 列表，只能看消息可见文本。最�
 | `globalConcurrency` | 同时调用 DSH 的群数上限 | `2` |
 | `maxQueuePerGroup` | 每群排队上限，满了丢弃新触发 | `10` |
 | `partDelayMs` | 分条发送之间的间隔 | `500` |
+| `memoryMaxEntries` | 每群保留的长期记忆条数 | `1000` |
+| `memoryResults` | 每次 @ 最多注入的相关记忆条数 | `6` |
+| `memoryMaxChars` | 相关记忆最大字符数 | `1800` |
 | `sendErrorNotice` | agent/发送失败时是否在群里提示 | `false` |
 | `logAllMessages` | 是否把白名单群的全部消息写入 JSONL | `true` |
+
+### stickers（可选，默认关闭）
+
+让 agent 在正常聊天里按语境自己选一张本地图片配图，不需要用户说“发表情包”。
+
+| 字段 | 说明 | 默认 |
+| --- | --- | --- |
+| `enabled` | 是否启用表情包 | `false` |
+| `directory` | 图片目录，相对配置文件 | `stickers` |
+| `autoLoad` | `enabled` 且 `items` 为空时自动扫描目录（仅一层，按文件名排序，最多 200 张 jpg/jpeg/png/gif）；`items` 非空时忽略 | `true` |
+| `cooldownMs` | 同群配图间隔，`0` 表示不限制 | `0` |
+| `items[].id` | 白名单 ID，`[A-Za-z0-9_-]`，模型只能返回它 | 必填 |
+| `items[].file` | 相对 `directory` 的 jpg/jpeg/png/gif，≤5MB | 必填 |
+| `items[].keywords` | 给模型看的用途关键词 | 必填 |
+| `items[].description` | 更细的语境描述，可选，≤500 字 | 空 |
+| `indexFile` | 视觉打标产出的 `sticker-index.json`（相对配置文件）；设了它就用索引当曲库，`autoLoad` 只在索引为空时兜底 | 空 |
+| `shortlistLimit` | 每轮从索引里挑多少张候选喂给模型（1~80） | `20` |
+
+`indexFile` 的搭配用法：`scripts/label-stickers-minimax.py` 在本地给图片生成 caption/keywords/mood/safe，`scripts/build-sticker-library.py` 过滤出可发布的一份（剔除 `safe:false`、被服务商拒审的、以及 `--drop 红包` 这类命中词），把 `stickers/` 和 `sticker-index.json` 一起放到服务器上，`directory` 指向前者、`indexFile` 指向后者。ID 由文件名决定，Node 与 collector 用同一套规则，改索引文件后无需重启（每轮自动热更新）。大曲库不会整份塞进提示词：本地先按关键词 + 描述二元字组粗筛，只把 `shortlistLimit` 张候选交给模型定夺。
+
+collector 会再校验一次扩展名、magic、大小、真实路径和目录越界；模型返回的 ID 不在白名单时只发文字。`SendFiles` 是文件发送接口，微信端是否显示为原生表情、GIF 是否保留动画需要真机确认。
+
+### vision（可选，默认关闭）
+
+被 @ 的人在此前 `contextWindowMs` 内发过图片时，把图片作为 DSH 的多模态输入一起投递。
+
+| 字段 | 说明 | 默认 |
+| --- | --- | --- |
+| `enabled` | 是否启用图片识别 | `false` |
+| `contextWindowMs` | 往前找图片的时间窗 | `120000` |
+| `maxImages` | 一次最多附带几张（1~4） | `2` |
+| `maxBytes` | 单张原图上限 | `5242880` |
+
+图片只从 wxauto4 下载，落盘后立即清理；会剥离 EXIF、限制像素并重新编码。当前模型是否真的支持图片要看 DSH 的模型能力，缺失时按普通文本降级并提示。群图片属于敏感数据，启用前请自行评估。
 
 ### stateDir
 
@@ -285,6 +327,7 @@ wxauto 3.9 不提供结构化的 at 列表，只能看消息可见文本。最�
 - **只在 @ 时回复**（`requireMention=true`），非 @ 消息只进入上下文和日志。
 - **每群串行**：同一群不会同时跑两个 DSH 回合；不同群最多 `globalConcurrency` 个并行。
 - **去重**：采集端消息 id + 2.5 秒内相同文本双重去重，防止 wxauto UI 重绘导致重复回复。
+- **长期记忆**：白名单群消息按群写入 `state/memory.jsonl`；收到 @ 时按当前内容检索相关消息，和最近上下文一起交给 agent。记忆不会跨群混用。
 - **限速与过期**：同群最小间隔 + 全局每分钟上限 + 每群队列上限；超过 `maxTriggerAgeMs` 的旧 @（例如停机后恢复、排队过久）直接丢弃，避免回一条几小时前的消息。
 - **无本地工具**：`wx-chat` preset 不挂载任何本地工具；即使 agent 被诱导，也没有命令/文件能力。桥接还会自动拒绝意外的工具审批和提问。
 - **回复审计**：把 Markdown 清成纯文本；把 `@所有人` / `@all` 改成全角，避免模型输出造成全体通知的歧义；超长回复分条，只有第一条 @ 发送者。
@@ -298,7 +341,7 @@ wxauto 3.9 不提供结构化的 at 列表，只能看消息可见文本。最�
 - 同名群、群名含正则特殊字符、成员昵称含特殊字符时，@ 和窗口匹配可能不准确。
 - 没有引用回复；回复是「@发送者 + 文本」。
 - 引用消息里如果出现机器人的 @ 别名，可能被当成直接 @ 触发（wxauto 3.9 没有结构化的 at 信息）。
-- 图片/文件/语音只以 `[图片]` 等占位文本进入上下文，agent 看不到内容（本 MVP 不做视觉）。
+- 图片/语音/文件默认仍以 `[图片]` 等占位文本进入上下文；只有显式开启 `vision` 且发送者在此前窗口内发过图时，图片才会作为 DSH 多模态输入。语音内容不转写。
 - DSH 事件流在回合中途断开时，这一轮回复可能丢失（等待器超时）；下一条 @ 会恢复正常。qq-bridge 对断线回合有更复杂的重放，本 MVP 没搬。
 - 没有 Web 控制台；排障靠 `state/*.log` 和 `state/*.jsonl`。
 
@@ -348,7 +391,7 @@ fake 后端不会真的发微信；它只把发送记录写到 stdout/`--send-lo
 
 ## 与 qq-bridge 的差异
 
-- 只做「群白名单 + @ 触发 + DSH 回复」，没有仿真群友、黑话学习、表情包、语音、Web 控制台和花费看板。
+- 只做「群白名单 + @ 触发 + DSH 回复」，没有仿真群友、黑话学习、语音、Web 控制台和花费看板；表情包和视觉理解是可选功能，默认关闭。
 - 工具面更窄：`wx-chat` 用 guard 拒绝**所有**工具；qq-bridge 的 `qq-chat` 允许一组 QQ MCP 工具。这里不打算让模型在群里执行动作。
 - 审批/提问：自动拒绝/空答案，不转发到微信；群聊里不做审批交互。
 - 会话映射、白名单、限速、去重、上下文和 DSH 协议客户端的思路与 qq-bridge 一致。
@@ -357,7 +400,7 @@ fake 后端不会真的发微信；它只把发送记录写到 stdout/`--send-lo
 
 - **成员白名单**：在 `Bridge.handleEvent` 里加 `allowedSenders`，只允许指定群友触发。
 - **引用回复**：collector 增加 `/quote` 端点，用 wxauto 的 `FriendMessage.quote()`；需要把消息 control 和 id 关联起来。
-- **图片理解**：collector 保存图片路径，桥接把 DSH 的多模态 content block 一起投递；需要模型支持视觉。
+- **语音**：TTS 生成音频文件相对容易，微信原生语音气泡是否可用要另测。
 - **更好的 @ 检测**：升级到维护中的 wxauto+ / wxautox（付费，支持较新微信），或改用 hook 型协议库（WeChatFerry 等，封号风险更高）。换后端时只需要改 `collector/backends/`。
 
 ## 上游与许可

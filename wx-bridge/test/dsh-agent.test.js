@@ -166,6 +166,58 @@ test('rebuilds the session once when DSH says session/not-found', async () => {
   }
 });
 
+test('verified inline content survives session rebuild with one accepted turn', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-bridge-dsh-'));
+  const fake = createFakeApi({ promptErrorOnce: { code: 'session/not-found', message: 'gone' } });
+  const cfg = { ...makeConfig(dir), vision: { enabled: true } };
+  const agent = new DshAgent(cfg, { store: new MemoryStore(), logger: quietLogger, api: fake.api });
+  const image = { mediaType: 'image/png', data: 'iVBORw0KGgo=', name: 'wx.png' };
+  await agent.start();
+  try {
+    await agent.ask('群A', '看图', { images: [image] });
+    assert.equal(fake.prompts.length, 2);
+    for (const prompt of fake.prompts) assert.deepEqual(prompt.content, [{ type: 'text', text: '看图' }, { type: 'image', ...image }]);
+    assert.equal(fake.created, 2);
+    await assert.rejects(agent.ask('群A', 'bad', { images: [{ ...image, data: 'data:image/png;base64,bad' }] }), /vision/);
+    assert.equal(fake.prompts.length, 2);
+  } finally { await agent.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('image/model refusal never resubmits an accepted or rejected non-session turn', async () => {
+  for (const accepted of [false, true]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-bridge-dsh-'));
+    const fake = createFakeApi({ promptErrorOnce: accepted ? null : { code: 'image/not-found', message: 'image unsupported' } });
+    if (accepted) {
+      const original = fake.api.sessions.prompt;
+      fake.api.sessions.prompt = async (params) => {
+        await original(params);
+        return ok({});
+      };
+    }
+    const cfg = { ...makeConfig(dir), vision: { enabled: true } };
+    if (accepted) cfg.dsh.turnTimeoutMs = 1;
+    const agent = new DshAgent(cfg, { store: new MemoryStore(), logger: quietLogger, api: fake.api });
+    await agent.start();
+    try {
+      await assert.rejects(agent.ask('群A', '看图', { images: [{ mediaType: 'image/png', data: 'iVBORw0KGgo=', name: 'wx.png' }] }));
+      assert.equal(fake.prompts.length, 1);
+      assert.equal(fake.created, 1);
+    } finally { await agent.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('vision model selection failure cannot fall back to another model', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-bridge-dsh-'));
+  const fake = createFakeApi();
+  fake.api.sessions.selectModel = async () => { throw new Error('model unavailable'); };
+  const agent = new DshAgent({ ...makeConfig(dir), vision: { enabled: true } }, { store: new MemoryStore(), logger: quietLogger, api: fake.api });
+  await agent.start();
+  try {
+    await assert.rejects(agent.ask('群A', '看图'), /拒绝切换/);
+    assert.equal(fake.prompts.length, 0);
+  } finally { await agent.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('fails loudly when the configured preset is missing', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-bridge-dsh-'));
   const fake = createFakeApi({ presets: [{ id: 'standard' }] });

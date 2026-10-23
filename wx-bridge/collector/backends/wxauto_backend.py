@@ -7,7 +7,9 @@
 - 每个被监听的群需要一个独立的 ChatWnd 窗口，窗口被关掉后需要重新 AddListenChat。
 """
 
+import os
 import re
+import queue
 import sys
 import threading
 import time
@@ -27,17 +29,70 @@ class WxAutoBackend:
         repo_root = Path(__file__).resolve().parents[3]
         if str(repo_root) not in sys.path:
             sys.path.insert(0, str(repo_root))
-        from wxauto import WeChat  # 仅 Windows 可导入
-
         self.groups = list(groups)
-        self.wx = WeChat()
+        self.mode = "legacy"
+        self.vision_enabled = False
+        self._callback_messages = queue.Queue()
+        self._seen_v4_ids = set()
+        # wxauto4 supports Weixin 4.x. Keep the legacy path for the archived
+        # wxauto 3.9 tests and installations that do not have wxauto4.
+        if "wxauto" not in sys.modules:
+            try:
+                from wxauto4 import WeChat
+                self.mode = "wxauto4"
+            except ImportError:
+                from wxauto import WeChat
+        else:
+            from wxauto import WeChat
+
+        # 排障时设 WX_BRIDGE_WXAUTO_DEBUG=1 让 wxauto 把它自己的动作打进日志。
+        self.debug = os.environ.get("WX_BRIDGE_WXAUTO_DEBUG") == "1"
+        # 发图后等待「自己这边出现新消息」的秒数，用来把静默失败变成可见错误。
+        self.delivery_wait_seconds = float(os.environ.get("WX_BRIDGE_SEND_VERIFY_SECONDS", "12"))
+        if self.mode == "wxauto4":
+            self.wx = WeChat(ads=False, debug=self.debug)
+        else:
+            self.wx = WeChat(debug=self.debug)
         self.self_nickname = str(getattr(self.wx, "nickname", "") or "")
         self.chats = {}
         self.errors = {}
         self._last_attempt = {}
         self._state_lock = threading.Lock()
-        for group in self.groups:
-            self._ensure_chat(group, force=True)
+        if self.mode == "wxauto4":
+            for group in self.groups:
+                self._ensure_chat_v4(group)
+            # Ignore messages already visible when the collector starts; only
+            # forward messages that arrive after startup.
+            try:
+                self._seen_v4_ids.update(
+                    str(getattr(message, "id", "") or "")
+                    for message in (self.wx.GetAllMessage() or [])
+                    if getattr(message, "id", "")
+                )
+            except Exception:
+                pass
+        else:
+            for group in self.groups:
+                self._ensure_chat(group, force=True)
+
+    def _on_v4_message(self, group, message, chat=None):
+        # wxauto4's callback chat object can be a detached window without a
+        # stable nickname; the registration site is the authoritative group.
+        group = str(group or "").strip()
+        if group in self.groups:
+            self._callback_messages.put((group, message))
+
+    def _ensure_chat_v4(self, group):
+        try:
+            chat = self.wx.GetSubWindow(group)
+            with self._state_lock:
+                self.chats[group] = chat
+                self.errors.pop(group, None)
+            return chat
+        except Exception as error:
+            with self._state_lock:
+                self.errors[group] = f"AddListenChat: {type(error).__name__}: {error}"
+            return None
 
     def _ensure_chat(self, group, force=False):
         now = time.monotonic()
@@ -80,6 +135,31 @@ class WxAutoBackend:
         }
 
     def poll(self):
+        if self.mode == "wxauto4":
+            messages = []
+            try:
+                new_messages = self.wx.GetAllMessage()
+            except Exception as error:
+                with self._state_lock:
+                    for group in self.groups:
+                        self.errors[group] = f"GetAllMessage: {type(error).__name__}: {error}"
+                return messages
+            allowed = set(self.groups)
+            for message in new_messages or []:
+                chat_info = getattr(message, "chat_info", {}) or {}
+                group = str(chat_info.get("chat_name", "") or "").strip()
+                if group not in allowed:
+                    continue
+                msg_id = str(getattr(message, "id", "") or "")
+                if msg_id and msg_id in self._seen_v4_ids:
+                    continue
+                if msg_id:
+                    self._seen_v4_ids.add(msg_id)
+                converted = self._convert(group, message)
+                if converted:
+                    messages.append(converted)
+            return messages
+
         messages = []
         for group in self.groups:
             chat = self.chats.get(group)
@@ -112,25 +192,108 @@ class WxAutoBackend:
         if not isinstance(content, str):
             content = str(content)
         if not content:
-            return None
+            if msg_type == "image":
+                content = "[图片]"
+            else:
+                return None
         sender = getattr(message, "sender", "") or getattr(message, "sender_remark", "") or "未知"
         sender = str(sender)
         msg_id = str(getattr(message, "id", "") or "")
         if not msg_id:
             msg_id = f"wxauto-{uuid.uuid4().hex}"
         media = MEDIA_RE.match(content)
+        is_image = msg_type == "image" or bool(media and media.group(1) == "图片")
         return {
             "id": msg_id,
             "group": group,
             "sender": sender,
             "text": content,
-            "kind": "media" if media else "text",
+            "kind": "image" if is_image else ("media" if media else "text"),
             "rawType": msg_type,
+            **({"_imageMessage": message} if is_image and getattr(self, "vision_enabled", False)
+               and self.mode == "wxauto4" else {}),
         }
+
+    def _check_send_result(self, result):
+        # Inspected wxauto4 41.1.7: WxResponse is a dict; only status=成功
+        # makes is_success / bool(response) true. Never mask a failed response.
+        if self.mode == "wxauto4":
+            if not isinstance(result, dict) or result.get("status") != "成功" or result.get("ok") is False:
+                raise RuntimeError(f"wxauto4 send failed: {result!r}")
+        elif result is not None and result is not True:
+            # Legacy SendMsg / detached-window SendFiles can return None on success.
+            raise RuntimeError(f"wxauto send failed: {result!r}")
+
+    def _chat_target(self, group):
+        """优先用该群自己的子窗口发图：主窗口的 who 参数在子窗口存在时会被忽略。"""
+        chat = self.chats.get(group)
+        if chat is not None and callable(getattr(chat, "SendFiles", None)):
+            return chat
+        return self.wx
+
+    def _self_signature(self, target):
+        """当前窗口里「自己发出的消息」指纹，用来确认发送是否真的落地。"""
+        try:
+            messages = target.GetAllMessage() or []
+        except Exception:
+            return None
+        ids = sorted(
+            str(getattr(message, "id", "") or "")
+            for message in messages
+            if str(getattr(message, "type", "") or "") == "self"
+        )
+        return ids if any(ids) else [str(len(ids))]
+
+    def _wait_until_delivered(self, target, before, timeout=None):
+        timeout = self.delivery_wait_seconds if timeout is None else timeout
+        if before is None or timeout <= 0:
+            # 读不到消息列表时不误判，只按接口返回判定。
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            after = self._self_signature(target)
+            if after is not None and after != before:
+                return True
+            time.sleep(0.5)
+        return False
 
     def send(self, group, text, at=None):
         if group not in self.groups:
             raise ValueError(f"group not allowed: {group}")
-        # WeChat.SendMsg 会优先复用同名 ChatWnd；窗口不存在时会自行打开聊天。
-        self.wx.SendMsg(text, who=group, at=at or None)
+        if self.mode == "wxauto4":
+            result = self.wx.SendMsg(text, who=group, at=at or None, exact=True)
+        else:
+            # WeChat.SendMsg 会优先复用同名 ChatWnd；窗口不存在时会自行打开聊天。
+            result = self.wx.SendMsg(text, who=group, at=at or None)
+        self._check_send_result(result)
         return {"ok": True}
+
+    def send_sticker(self, group, filepath, sticker_id):
+        if group not in self.groups:
+            raise ValueError(f"group not allowed: {group}")
+        # SendFiles is a file-send API, not a native WeChat sticker API.
+        target = self._chat_target(group)
+        before = self._self_signature(target)
+        try:
+            if target is self.wx:
+                result = self.wx.SendFiles(filepath, who=group, exact=True) if self.mode == "wxauto4" \
+                    else self.wx.SendFiles(filepath, who=group)
+            else:
+                # 子窗口的 who 参数无效，直接发到这个群自己的窗口。
+                result = target.SendFiles(filepath)
+            self._check_send_result(result)
+        except Exception as error:
+            if target is self.wx:
+                raise
+            # 子窗口可能已被用户关掉，退回主窗口再试一次。
+            with self._state_lock:
+                self.chats.pop(group, None)
+            self.errors[group] = f"SendFiles 子窗口失败，已改用主窗口：{type(error).__name__}: {error}"
+            target = self.wx
+            before = self._self_signature(target)
+            result = self.wx.SendFiles(filepath, who=group, exact=True) if self.mode == "wxauto4" \
+                else self.wx.SendFiles(filepath, who=group)
+            self._check_send_result(result)
+        if not self._wait_until_delivered(target, before):
+            raise RuntimeError("图片未确认送达：微信里没有出现新的发送记录")
+        return {"ok": True, "stickerId": sticker_id, "delivered": True}

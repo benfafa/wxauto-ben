@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { normalizeStickers } from './stickers.js';
+import { normalizeVision } from './vision.js';
 
 const DEFAULTS = Object.freeze({
   wechat: {
@@ -39,7 +41,10 @@ const DEFAULTS = Object.freeze({
     logAllMessages: true,
     globalConcurrency: 2,
     maxQueuePerGroup: 10,
-    partDelayMs: 500
+      partDelayMs: 500,
+      memoryMaxEntries: 1000,
+      memoryResults: 6,
+      memoryMaxChars: 1800
   },
   stateDir: 'state'
 });
@@ -205,6 +210,8 @@ export function loadConfig(file) {
   const cfg = {
     configFile,
     stateDir,
+    stickers: normalizeStickers(raw.stickers, baseDir),
+    vision: normalizeVision(raw.vision),
     wechat: {
       collectorUrl: requireUrl(merged.wechat.collectorUrl, 'wechat.collectorUrl'),
       token,
@@ -242,7 +249,10 @@ export function loadConfig(file) {
       logAllMessages: requireBool(merged.behavior.logAllMessages, 'behavior.logAllMessages', true),
       globalConcurrency: requireInt(merged.behavior.globalConcurrency, 'behavior.globalConcurrency', 1, 4, DEFAULTS.behavior.globalConcurrency),
       maxQueuePerGroup: requireInt(merged.behavior.maxQueuePerGroup, 'behavior.maxQueuePerGroup', 1, 100, DEFAULTS.behavior.maxQueuePerGroup),
-      partDelayMs: requireInt(merged.behavior.partDelayMs, 'behavior.partDelayMs', 0, 5000, DEFAULTS.behavior.partDelayMs)
+      partDelayMs: requireInt(merged.behavior.partDelayMs, 'behavior.partDelayMs', 0, 5000, DEFAULTS.behavior.partDelayMs),
+      memoryMaxEntries: requireInt(merged.behavior.memoryMaxEntries, 'behavior.memoryMaxEntries', 100, 10000, DEFAULTS.behavior.memoryMaxEntries),
+      memoryResults: requireInt(merged.behavior.memoryResults, 'behavior.memoryResults', 1, 20, DEFAULTS.behavior.memoryResults),
+      memoryMaxChars: requireInt(merged.behavior.memoryMaxChars, 'behavior.memoryMaxChars', 300, 10000, DEFAULTS.behavior.memoryMaxChars)
     }
   };
 

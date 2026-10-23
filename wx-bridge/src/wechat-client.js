@@ -7,8 +7,32 @@ export class CollectorError extends Error {
   }
 }
 
-async function readJson(response) {
-  const text = await response.text();
+async function readJson(response, maxBytes) {
+  let text;
+  if (maxBytes) {
+    if (Number(response.headers.get('content-length')) > maxBytes) {
+      await response.body?.cancel();
+      throw new CollectorError('采集端图片响应过大');
+    }
+    const reader = response.body?.getReader();
+    const chunks = [];
+    let size = 0;
+    if (reader) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > maxBytes) {
+            await reader.cancel();
+            throw new CollectorError('采集端图片响应过大');
+          }
+          chunks.push(value);
+        }
+      } finally { reader.releaseLock(); }
+    }
+    text = Buffer.concat(chunks).toString('utf8');
+  } else text = await response.text();
   if (!text) return {};
   try {
     return JSON.parse(text);
@@ -29,7 +53,7 @@ export class CollectorClient {
     this.timeoutMs = timeoutMs;
   }
 
-  async request(pathname, { method = 'GET', body, timeoutMs, signal } = {}) {
+  async request(pathname, { method = 'GET', body, timeoutMs, signal, maxResponseBytes } = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('collector request timeout')), timeoutMs ?? this.timeoutMs);
     const onAbort = () => controller.abort(signal.reason);
@@ -38,6 +62,7 @@ export class CollectorClient {
     try {
       const response = await fetch(`${this.baseUrl}${pathname}`, {
         method,
+        redirect: 'error',
         headers: {
           authorization: `Bearer ${this.token}`,
           ...(body === undefined ? {} : { 'content-type': 'application/json' })
@@ -45,7 +70,7 @@ export class CollectorClient {
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal
       });
-      const payload = await readJson(response);
+      const payload = await readJson(response, maxResponseBytes);
       if (!response.ok || payload?.ok === false) {
         throw new CollectorError(payload?.error || `采集端 HTTP ${response.status}`, {
           status: response.status,
@@ -76,6 +101,21 @@ export class CollectorClient {
     return this.request(`/poll?${params}`, {
       signal,
       timeoutMs: Math.max(this.timeoutMs, (waitMs ?? 0) + 5000)
+    });
+  }
+
+  image({ group, imageId, signal }) {
+    return this.request('/image', { method: 'POST', body: { group, imageId }, signal,
+      maxResponseBytes: Math.ceil(5242880 / 3) * 4 + 1024,
+      timeoutMs: Math.max(this.timeoutMs, 50000) });
+  }
+
+  sendSticker({ group, stickerId, signal }) {
+    return this.request('/send-sticker', {
+      method: 'POST',
+      body: { group, stickerId },
+      signal,
+      timeoutMs: Math.max(this.timeoutMs, 50000)
     });
   }
 

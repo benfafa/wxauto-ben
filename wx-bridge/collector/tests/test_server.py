@@ -1,8 +1,12 @@
 import json
 import sys
+import tempfile
+import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
+from concurrent.futures import Future
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -11,14 +15,25 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from collector.backends.fake_backend import FakeBackend  # noqa: E402
-from collector.server import CollectorService  # noqa: E402
+from collector.server import CollectorService, StickerJob  # noqa: E402
+from collector.stickers import StickerCatalog  # noqa: E402
 
 TOKEN = "0123456789abcdef0123456789abcdef"
 
 
 class CollectorServerTest(unittest.TestCase):
     def setUp(self):
-        self.backend = FakeBackend(["测试群"])
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        directory = Path(self.temp.name) / "stickers"
+        directory.mkdir()
+        self.image = directory / "happy.png"
+        self.image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        self.send_log = Path(self.temp.name) / "sent.jsonl"
+        stickers = StickerCatalog({"enabled": True, "items": [
+            {"id": "happy", "file": "happy.png", "keywords": ["开心"]}
+        ]}, base_dir=self.temp.name)
+        self.backend = FakeBackend(["测试群"], send_log=self.send_log)
         self.service = CollectorService(
             self.backend,
             TOKEN,
@@ -26,6 +41,7 @@ class CollectorServerTest(unittest.TestCase):
             poll_ms=100,
             port=0,
             allow_inject=True,
+            stickers=stickers,
         ).start()
         self.base = f"http://127.0.0.1:{self.service.port}"
 
@@ -125,6 +141,93 @@ class CollectorServerTest(unittest.TestCase):
             "text": "@小助手 在吗",
         })
         self.assertEqual(status, 403)
+
+    def test_sticker_and_text_use_the_same_ui_worker_and_audit_ids(self):
+        threads = []
+        send = self.backend.send_sticker
+
+        def record_thread(*args):
+            threads.append(threading.current_thread().name)
+            return send(*args)
+
+        with patch.object(self.backend, "send_sticker", side_effect=record_thread):
+            self.assertEqual(self.http("POST", "/send", {"group": "测试群", "text": "你好"})[0], 200)
+            status, payload = self.http("POST", "/send-sticker", {"group": "测试群", "stickerId": "happy"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload, {"ok": True, "stickerId": "happy"})
+        self.assertEqual(threads, ["wxauto-ui"])
+        sent = self.backend.sent()
+        self.assertEqual(sent[0]["text"], "你好")
+        self.assertEqual(sent[1]["stickerId"], "happy")
+        self.assertEqual(sent[1]["file"], str(self.image.resolve()))
+        records = [json.loads(line) for line in self.send_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(records[1]["kind"], "sticker")
+        self.assertEqual(records[1]["stickerId"], "happy")
+        self.assertEqual(self.service.health()["sendCount"], 2)
+
+    def test_sticker_http_rejects_auth_targets_ids_paths_and_disabled(self):
+        body = {"group": "测试群", "stickerId": "happy"}
+        self.assertEqual(self.http("POST", "/send-sticker", body, token=None)[0], 401)
+        self.assertEqual(self.http("POST", "/send-sticker", {**body, "group": "其他群"})[0], 403)
+        self.assertEqual(self.http("POST", "/send-sticker", {**body, "stickerId": "unknown"})[0], 404)
+        for invalid in [{**body, "file": str(self.image)}, {**body, "path": str(self.image)},
+                        {"group": "测试群"}, {**body, "stickerId": "../happy.png"},
+                        {**body, "stickerId": str(self.image)}, {**body, "stickerId": []}]:
+            self.assertEqual(self.http("POST", "/send-sticker", invalid)[0], 400)
+        self.service.stickers = StickerCatalog()
+        status, payload = self.http("POST", "/send-sticker", body)
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["code"], "stickers-disabled")
+        self.assertEqual(self.backend.sent(), [])
+        self.assertEqual(self.http("POST", "/send", {"group": "测试群", "text": "仍可发文字"})[0], 200)
+
+    def test_cancelled_sticker_job_never_reaches_backend(self):
+        future = Future()
+        future.cancel()
+        self.service._handle_send(StickerJob(group="测试群", sticker_id="happy", future=future))
+        self.assertEqual(self.backend.sent(), [])
+        self.assertTrue(future.cancelled())
+
+    def test_explicit_text_failure_remains_an_http_error(self):
+        for result in [False, {"ok": False}]:
+            with patch.object(self.backend, "send", return_value=result):
+                status, payload = self.http("POST", "/send", {"group": "测试群", "text": "失败"})
+            self.assertEqual(status, 500)
+            self.assertFalse(payload["ok"])
+        self.assertEqual(self.service.health()["sendCount"], 0)
+
+    def test_sticker_is_revalidated_after_enqueue_before_backend_send(self):
+        put = self.service._jobs.put
+
+        def replace_after_validation(job):
+            if isinstance(job, StickerJob):
+                self.image.write_bytes(b"invalid replacement")
+            put(job)
+
+        with patch.object(self.service._jobs, "put", side_effect=replace_after_validation):
+            status, payload = self.http("POST", "/send-sticker", {"group": "测试群", "stickerId": "happy"})
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "invalid-sticker-file")
+        self.assertEqual(self.backend.sent(), [])
+        self.assertEqual(self.service.health()["sendCount"], 0)
+
+    def test_sticker_failures_are_http_errors_not_success_and_worker_recovers(self):
+        for result in [False, {"ok": False}, None]:
+            with patch.object(self.backend, "send_sticker", return_value=result):
+                status, payload = self.http("POST", "/send-sticker", {"group": "测试群", "stickerId": "happy"})
+            self.assertEqual(status, 500, payload)
+            self.assertFalse(payload["ok"])
+        with patch.object(self.backend, "send_sticker", side_effect=RuntimeError("UI failed")):
+            self.assertEqual(self.http("POST", "/send-sticker", {"group": "测试群", "stickerId": "happy"})[0], 500)
+        self.assertEqual(self.service.health()["sendCount"], 0)
+        self.assertEqual(self.http("POST", "/send", {"group": "测试群", "text": "之后的文字"})[0], 200)
+
+    def test_invalid_sticker_file_is_rejected_over_http(self):
+        self.image.unlink()
+        status, payload = self.http("POST", "/send-sticker", {"group": "测试群", "stickerId": "happy"})
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "invalid-sticker-file")
+        self.assertEqual(self.backend.sent(), [])
 
     def test_long_poll_waits_when_empty(self):
         started = time.monotonic()

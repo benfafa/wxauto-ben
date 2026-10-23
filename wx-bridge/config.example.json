@@ -40,7 +40,25 @@
     "logAllMessages": true,
     "globalConcurrency": 2,
     "maxQueuePerGroup": 10,
-    "partDelayMs": 500
+    "partDelayMs": 500,
+    "memoryMaxEntries": 1000,
+    "memoryResults": 6,
+    "memoryMaxChars": 1800
+  },
+  "stickers": {
+    "enabled": false,
+    "directory": "stickers",
+    "autoLoad": true,
+    "cooldownMs": 0,
+    "items": [],
+    "indexFile": "sticker-index.json",
+    "shortlistLimit": 20
+  },
+  "vision": {
+    "enabled": false,
+    "contextWindowMs": 120000,
+    "maxImages": 2,
+    "maxBytes": 5242880
   },
   "stateDir": "state"
 }
