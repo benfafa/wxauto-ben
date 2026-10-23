@@ -4,9 +4,16 @@
 只在本地跑：API Key 从环境变量 MINIMAX_API_KEY 或 ~/.wx-bridge-minimax-key 读取，
 脚本和索引里都不会保存 Key。可中断续跑：已有标签且文件哈希未变的会跳过。
 
+几条实测出来的规矩（改参数前先看一眼）：
+- 一次只能跑一个实例，靠 <index>.lock 挡；两个进程会各自持有内存索引互相覆盖。
+- 请求本身要 15~45 秒（模型带隐藏思考），吞吐靠 --workers，不靠把间隔调到 0；
+  429 会全局加倍间隔，所以 --rate-interval 只是下限。
+- --max-tokens 至少 1600：思考会把预算吃光，JSON 被截断时会自动加倍重试。
+- 写盘前会重新读一次磁盘索引并合并，失败的条目不会覆盖已打好的标签。
+
 用法：
     python scripts/label-stickers-minimax.py --dir C:\\path\\to\\stickers
-    python scripts/label-stickers-minimax.py --dir ... --limit 5 --workers 2
+    python scripts/label-stickers-minimax.py --dir ... --limit 5 --workers 3
 """
 
 import argparse

@@ -1,5 +1,11 @@
-// 表情包视觉打标：扫目录 → 逐张交给 DSH 视觉模型 → 写 state/sticker-index.json。
-// 可中断续跑：已有 caption 的文件会跳过；每张写完立即落盘。
+// 表情包视觉打标的备用实现：扫目录 → 逐张交给 DSH 视觉模型 → 写索引。
+// 主用 scripts/label-stickers-minimax.py（本地跑、支持限流与断点续跑）；
+// 这个版本适合“机器上已经有 DSH、但不想在本地配另一个 API Key”的场景。
+//
+// 默认写 <项目根>/sticker-index.json，也就是 config.json 里 stickers.indexFile
+// 默认指向的那份；--index 可以改成任意路径。两份脚本写的是同一套字段
+// （file/bytes/sha256/caption/keywords/mood/safe/updatedAt），可以混着用。
+// 可中断续跑：已有 caption 且 sha256 未变的文件会跳过；每张写完立即落盘。
 //
 // 用法（在 wx-bridge 目录下）：
 //   node scripts/caption-stickers.mjs                       # 全量
@@ -132,7 +138,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cfg = loadConfig(path.resolve(ROOT, args.configFile));
   const dir = path.resolve(ROOT, args.dir || cfg.stickers.directory || 'stickers');
-  const indexFile = path.resolve(ROOT, args.index || path.join(cfg.stateDir, 'sticker-index.json'));
+  const indexFile = path.resolve(ROOT, args.index || 'sticker-index.json');
   if (!fs.existsSync(dir)) throw new Error(`找不到表情包目录：${dir}`);
   const lock = acquireIndexLock(`${indexFile}.lock`);
 

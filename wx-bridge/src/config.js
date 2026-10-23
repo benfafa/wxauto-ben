@@ -42,10 +42,10 @@ const DEFAULTS = Object.freeze({
     logAllMessages: true,
     globalConcurrency: 2,
     maxQueuePerGroup: 10,
-      partDelayMs: 500,
-      memoryMaxEntries: 1000,
-      memoryResults: 6,
-      memoryMaxChars: 1800
+    partDelayMs: 500,
+    memoryMaxEntries: 1000,
+    memoryResults: 6,
+    memoryMaxChars: 1800
   },
   stateDir: 'state'
 });

@@ -32,17 +32,19 @@ DSH (dsh web, 默认 127.0.0.1:3080) ──> 微信回复（@ 发送者）
 
 ## 当前验证状态
 
-在 macOS 上完成并通过：
+自动化测试（本地跑）：
 
 ```bash
 cd wx-bridge
-npm test                                             # 42 项通过
-python3 -m unittest discover -s collector/tests      # 11 项通过
+npm test                                             # 96 项通过
+python -m pytest collector/tests -q                  # 59 项通过（2 项按平台跳过）
 ```
 
-覆盖：配置 fail-closed、@ 检测、上下文、Markdown 清理/分条、每群串行与限速、DSH 会话创建/not-found 重建、preset 安装与工具守卫、wxauto 消息归一化、Node ↔ Python 采集端真实 HTTP 联调。
+覆盖：配置 fail-closed、@ 检测、上下文、Markdown 清理/分条、每群串行与限速、DSH 会话创建/not-found 重建/进程重启后重新 follow、preset 安装与工具守卫、wxauto 消息归一化（含 4.x 的 attr/type 字段模型）、表情索引与 Node↔collector 的 ID 一致性、主动插话的四道闸门、Node ↔ Python 采集端真实 HTTP 联调。
 
-**尚未在真实 Windows 微信 + 真实 DSH 上跑过**（本次开发环境没有 Windows 和 DSH 模型）。真机验收清单见文末。
+真机状态（2026-10-24，Windows Server 2025 + 微信 4.1.8.107 + wxauto4 41.1.7 + DSH）：群里 @ 能回、表情按语境发出并确认送达、群图能识别；远程桌面断开后由 watchdog 自动把会话挂回 console。
+
+部署、更新、排障见 [DEPLOY.md](DEPLOY.md)。
 
 ## 前置条件
 
@@ -80,6 +82,7 @@ wx-bridge/
   scripts/build-sticker-library.py   按标签整理可部署曲库（过滤不安全/被拒审/命中剔除词）
   scripts/caption-stickers.mjs       在服务器上用 DSH 打标的备选实现
   deploy/watchdog.ps1             服务器侧每分钟看门狗：断线重挂 console、拉起守护脚本
+  DEPLOY.md           服务器部署与运维手册（拓扑/首次部署/更新/排障）
   test/                 Node 测试
   collector/tests/      Python 测试
   config.example.json
