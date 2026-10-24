@@ -147,7 +147,7 @@ class StickerCatalog:
         if config is None:
             config = {}
         _object(config, ("enabled", "directory", "cooldownMs", "autoLoad", "items",
-                         "indexFile", "shortlistLimit"), "stickers")
+                         "indexFile", "extraIndexFile", "shortlistLimit"), "stickers")
         self.enabled = config.get("enabled", False)
         if not isinstance(self.enabled, bool):
             raise ValueError("stickers.enabled must be boolean")
