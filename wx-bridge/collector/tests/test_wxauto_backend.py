@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -183,6 +184,26 @@ class WxAutoBackendTest(unittest.TestCase):
         health = self.backend.health()
         self.assertEqual(health["selfNickname"], "机器人账号")
         self.assertEqual(health["listening"], ["群A"])
+
+
+    def test_emotion_is_captured_as_sticker_visual(self):
+        self.backend.mode = "wxauto4"
+        self.backend.vision_enabled = True
+        message = FakeMessage(msg_type="emotion", content="动画表情", msg_id="e1")
+        captured = object()
+        with patch("collector.capture.capture_message", return_value=captured):
+            event = self.backend._convert("群A", message)
+        self.assertEqual(event["kind"], "sticker")
+        self.assertIs(event["_imageMessage"], captured)
+
+    def test_emotion_without_capture_stays_text_only(self):
+        self.backend.mode = "wxauto4"
+        self.backend.vision_enabled = True
+        message = FakeMessage(msg_type="emotion", content="动画表情", msg_id="e2")
+        with patch("collector.capture.capture_message", return_value=None):
+            event = self.backend._convert("群A", message)
+        self.assertEqual(event["kind"], "sticker")
+        self.assertNotIn("_imageMessage", event)
 
 
 class SubWindowFake:

@@ -491,3 +491,18 @@ test('语音失败时退回文字，不让消息空着', async () => {
   assert.equal(collector.sent.length, 1);
   assert.equal(collector.sent[0].text, '退回去的文字');
 });
+
+test('表情包作为附图参与理解，但不单独触发回复', async () => {
+  const agent = makeAgent('嗯。');
+  const bridge = makeBridge({ vision: { enabled: true, contextWindowMs: 120000, maxImages: 2, maxBytes: 5242880 }, agent }).bridge;
+  const stamp = Date.now();
+  const imageId = 'a'.repeat(32);
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '动画表情', kind: 'sticker',
+    imageId, id: 's1', seq: 1, timestamp: stamp / 1000 });
+  await bridge.flush();
+  // 没 @ 不触发，但已经进候选池
+  assert.equal(agent.calls.length, 0);
+  const picked = bridge.images.candidates('群A', '李四', stamp, stamp);
+  assert.equal(picked.length, 1);
+  assert.equal(picked[0].imageId, imageId);
+});

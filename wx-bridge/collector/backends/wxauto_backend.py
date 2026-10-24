@@ -217,15 +217,22 @@ class WxAutoBackend:
             msg_id = f"wxauto-{uuid.uuid4().hex}"
         media = MEDIA_RE.match(content)
         is_image = msg_type == "image" or bool(media and media.group(1) == "图片")
+        is_sticker = msg_type == "emotion"
+        can_look = getattr(self, "vision_enabled", False) and self.mode == "wxauto4"
+        captured = None
+        if is_sticker and can_look:
+            # 表情没有下载接口，改为截消息气泡；失败就只留文字。
+            from collector.capture import capture_message
+            captured = capture_message(message)
+        attach = captured if is_sticker else (message if is_image and can_look else None)
         return {
             "id": msg_id,
             "group": group,
             "sender": sender,
             "text": content,
-            "kind": "image" if is_image else ("media" if media else "text"),
+            "kind": "image" if is_image else ("sticker" if is_sticker else ("media" if media else "text")),
             "rawType": msg_type,
-            **({"_imageMessage": message} if is_image and getattr(self, "vision_enabled", False)
-               and self.mode == "wxauto4" else {}),
+            **({"_imageMessage": attach} if attach is not None else {}),
         }
 
     def _check_send_result(self, result):

@@ -227,7 +227,7 @@ class CollectorService:
                     event.pop("imageId", None)
                     if event.get("group") not in self.allowed_groups:
                         continue
-                    if self.images.config["enabled"] and event.get("kind") == "image":
+                    if self.images.config["enabled"] and event.get("kind") in ("image", "sticker"):
                         event["imageId"] = self.images.register(event["group"], image_message)
                     if image_message is not None and self.inbox.cfg["enabled"]:
                         try:

@@ -261,8 +261,10 @@ export class Bridge {
     }
 
     const isImage = event.kind === 'image' || (event.kind === 'media' && rawText.startsWith('[图片]'));
+    // 表情包只作为「可看的附图」参与理解，不单独触发回复，否则群里每张表情都会招来一句。
+    const isVisual = isImage || event.kind === 'sticker';
     const eventTime = Number(event.timestamp) > 0 ? Number(event.timestamp) * 1000 : now;
-    this.images.add({ group, sender, kind: isImage ? 'image' : event.kind, imageId: event.imageId, timestamp: eventTime / 1000 }, now);
+    this.images.add({ group, sender, kind: isVisual ? 'image' : event.kind, imageId: event.imageId, timestamp: eventTime / 1000 }, now);
     const textKey = `${group}\u0000${sender}\u0000${isImage ? messageId : rawText}`;
     const lastTextAt = this.recentTexts.get(textKey) ?? 0;
     if (now - lastTextAt < 2500) {
