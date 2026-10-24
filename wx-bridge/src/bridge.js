@@ -44,7 +44,7 @@ export function personaFor(text) {
 function personaLine(persona) {
   return persona === '猫娘'
     ? `【本轮人格】猫娘 —— 对方这条消息里带了「${CATGIRL_KEYWORD}」，用傲娇猫娘的语气回。`
-    : '【本轮人格】损友 —— 用默认的嘴硬损友语气回，可以损，但守住人设里的底线。';
+    : '【本轮人格】损友 —— 贴吧嘴臭老哥，直接情绪输出，怎么损你自己判断；只守人设里那几条硬边界。';
 }
 
 export function buildPrompt({ group, sender, text, context, memory = '（无）', stickers, vision, images = [],
