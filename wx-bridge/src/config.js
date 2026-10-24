@@ -44,6 +44,7 @@ const DEFAULTS = Object.freeze({
     logAllMessages: true,
     globalConcurrency: 2,
     maxQueuePerGroup: 10,
+    stickerReplyWindowMs: 60000,
     partDelayMs: 500,
     memoryMaxEntries: 1000,
     memoryResults: 6,
@@ -269,6 +270,8 @@ export function loadConfig(file) {
       logAllMessages: requireBool(merged.behavior.logAllMessages, 'behavior.logAllMessages', true),
       globalConcurrency: requireInt(merged.behavior.globalConcurrency, 'behavior.globalConcurrency', 1, 4, DEFAULTS.behavior.globalConcurrency),
       maxQueuePerGroup: requireInt(merged.behavior.maxQueuePerGroup, 'behavior.maxQueuePerGroup', 1, 100, DEFAULTS.behavior.maxQueuePerGroup),
+      // 刚回过的人发表情，算作对刚才那句话的回应；0 表示不启用。
+      stickerReplyWindowMs: requireInt(merged.behavior.stickerReplyWindowMs, 'behavior.stickerReplyWindowMs', 0, 600000, DEFAULTS.behavior.stickerReplyWindowMs),
       partDelayMs: requireInt(merged.behavior.partDelayMs, 'behavior.partDelayMs', 0, 5000, DEFAULTS.behavior.partDelayMs),
       memoryMaxEntries: requireInt(merged.behavior.memoryMaxEntries, 'behavior.memoryMaxEntries', 100, 10000, DEFAULTS.behavior.memoryMaxEntries),
       memoryResults: requireInt(merged.behavior.memoryResults, 'behavior.memoryResults', 1, 20, DEFAULTS.behavior.memoryResults),

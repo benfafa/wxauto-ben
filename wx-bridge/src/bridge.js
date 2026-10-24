@@ -48,7 +48,7 @@ function personaLine(persona) {
 }
 
 export function buildPrompt({ group, sender, text, context, memory = '（无）', stickers, vision, images = [],
-  conversation = false, persona = '损友' }) {
+  conversation = false, stickerReply = false, persona = '损友' }) {
   const safeText = truncateText(String(text ?? '').trim(), 4000) || '（空消息）';
   const imageNote = images.length
     ? `【本轮附图】共 ${images.length} 张，按时间先后：${images.map((image, index) => `第${index + 1}张由${oneLine(image.sender)}发送`).join('；')}。`
@@ -73,6 +73,7 @@ export function buildPrompt({ group, sender, text, context, memory = '（无）'
     memory,
     '>>>',
     imageNote,
+    stickerReply ? '【注意】对方刚被回过一句，现在只发了个表情：把它理解成对刚才那句话的回应，接着聊，不要要求他打字。' : '',
     conversation ? '【连续对话】这条消息没有 @ 你：你们正在连续对话，直接用平常语气接话，不要再 @ 回去，也不要提"你刚才@我"之类的话。' : '',
     '',
     '请直接给出要发回群里的话：简短、纯文本、不要 Markdown、不要描述你的动作。',
@@ -113,6 +114,8 @@ export class Bridge {
       .map((alias) => String(alias).replace(/^@+/, '').trim()).filter(Boolean));
     this.recentInbound = new Map();
     this.lastInboundText = new Map();
+    // 刚回过谁：表情没有 @、也没有文字，只能靠“这个人刚被我回过”判断是在接话。
+    this.lastReplyTo = new Map();
     this.lastProactiveAt = new Map();
     this.proactiveTimes = [];
     this.replyTimes = [];
@@ -263,6 +266,8 @@ export class Bridge {
     const isImage = event.kind === 'image' || (event.kind === 'media' && rawText.startsWith('[图片]'));
     // 表情包只作为「可看的附图」参与理解，不单独触发回复，否则群里每张表情都会招来一句。
     const isVisual = isImage || event.kind === 'sticker';
+    const stickerReply = isVisual && !isImage && Boolean(event.imageId)
+      && this.#stickerReplyDue(group, sender, now);
     const eventTime = Number(event.timestamp) > 0 ? Number(event.timestamp) * 1000 : now;
     this.images.add({ group, sender, kind: isVisual ? 'image' : event.kind, imageId: event.imageId, timestamp: eventTime / 1000 }, now);
     const textKey = `${group}\u0000${sender}\u0000${isImage ? messageId : rawText}`;
@@ -316,7 +321,7 @@ export class Bridge {
       });
     }
 
-    if ((this.cfg.behavior.requireMention || isImage) && !mentioned && !conversationTurn) return;
+    if ((this.cfg.behavior.requireMention || isImage) && !mentioned && !conversationTurn && !stickerReply) return;
     if (this.stopping) return;
 
     if (this.cfg.behavior.maxTriggerAgeMs > 0 && now - eventTime > this.cfg.behavior.maxTriggerAgeMs) {
@@ -353,10 +358,11 @@ export class Bridge {
       group,
       sender,
       text: cleaned || (mentioned ? '（对方只 @ 了你，没有说具体内容）' : '（空消息）'),
-      images: mentioned ? this.images.candidates(group, sender, eventTime, now) : [],
+      images: mentioned || stickerReply ? this.images.candidates(group, sender, eventTime, now) : [],
       messageId,
       receivedAt: eventTime,
-      conversation: conversationTurn
+      conversation: conversationTurn,
+      stickerReply
     };
     const previous = this.chains.get(group) ?? Promise.resolve();
     const next = previous
@@ -429,6 +435,14 @@ export class Bridge {
     this.chains.set(group, next);
   }
 
+  /** 这个人是不是刚被我回过，且还在窗口内。 */
+  #stickerReplyDue(group, sender, now) {
+    const windowMs = this.cfg.behavior.stickerReplyWindowMs;
+    if (!windowMs) return false;
+    const last = this.lastReplyTo.get(group);
+    return Boolean(last && last.sender === sender && now - last.at <= windowMs);
+  }
+
   #pruneDedup(now) {
     if (this.seenIds.size < 4000) return;
     const cutoff = now - 10 * 60_000;
@@ -488,7 +502,8 @@ export class Bridge {
         const prompt = proactiveTurn
           ? buildProactivePrompt({ group, context, memory, stickers: this.cfg.stickers })
           : buildPrompt({ group, sender, text, context, memory, conversation: conversationTurn,
-            persona: personaFor(text), stickers: this.cfg.stickers, vision: this.cfg.vision, images: job.images });
+            stickerReply: job.stickerReply === true, persona: personaFor(text),
+            stickers: this.cfg.stickers, vision: this.cfg.vision, images: job.images });
         this.log.info(proactiveTurn ? `主动插话回合：群「${group}」`
           : `调用 agent：群「${group}」 ${sender}：${truncateText(text, 80)}`);
         result = await this.agent.ask(group, prompt, { images });
@@ -530,6 +545,7 @@ export class Bridge {
         const voice = await this.collector.sendTts({ group, text: plain });
         if (voice?.ok !== true) throw new Error('语音发送未确认');
         this.lastSentByGroup.set(group, Date.now());
+        if (sender) this.lastReplyTo.set(group, { sender, at: Date.now() });
         this.log.message({ direction: 'out', kind: 'voice', group, text: plain, replyTo: messageId });
         this.log.activity({ type: 'voice-sent', group, sender: sender ?? null, messageId,
           chars: plain.length, bytes: voice.bytes ?? null });
@@ -560,6 +576,8 @@ export class Bridge {
     }
     if (sent > 0) {
       this.lastSentByGroup.set(group, Date.now());
+      // 记下"刚回过谁"，供他接下来只发一个表情时判断是在接话。
+      if (sender) this.lastReplyTo.set(group, { sender, at: Date.now() });
       if (conversationTurn) {
         const gate = this.conversations.countTurn(group, Date.now());
         if (!gate.ok) {

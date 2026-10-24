@@ -17,6 +17,8 @@ function makeCollector() {
     sent,
     tts,
     sendTts: async (payload) => { tts.push(payload); return { ok: true, bytes: 1024 }; },
+    image: async ({ imageId }) => ({ mediaType: 'image/png', name: 'wx.png',
+      data: 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP8zwACTGCSAQANHQEDgslx/wAAAABJRU5ErkJggg==' }),
     health: async () => ({ selfNickname: 'Bot', groups: ['群A'], backend: 'fake' }),
     cursor: async () => ({ collectorId: 'c1', cursor: 0 }),
     poll: async () => ({ collectorId: 'c1', cursor: 0, events: [] }),
@@ -505,4 +507,44 @@ test('表情包作为附图参与理解，但不单独触发回复', async () =>
   const picked = bridge.images.candidates('群A', '李四', stamp, stamp);
   assert.equal(picked.length, 1);
   assert.equal(picked[0].imageId, imageId);
+});
+
+test('刚回过的人发表情，当成对刚才那句话的回应', async () => {
+  const VISION = { enabled: true, contextWindowMs: 120000, maxImages: 2, maxBytes: 5242880 };
+  const agent = makeAgent('行吧，看在你发图的份上不损你了。');
+  const collector = makeCollector();
+  const bridge = makeBridge({ vision: VISION, agent, collector,
+    behavior: { stickerReplyWindowMs: 60000 } }).bridge;
+  const stamp = Date.now();
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '@小助手 在吗', id: 'm1', seq: 1, timestamp: stamp / 1000 });
+  await bridge.flush();
+  assert.equal(agent.calls.length, 1);
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '动画表情', kind: 'sticker',
+    imageId: 'b'.repeat(32), id: 'm2', seq: 2, timestamp: stamp / 1000 });
+  await bridge.flush();
+  assert.equal(agent.calls.length, 2, '刚回过的人发表情应当接一句');
+  assert.match(agent.calls[1].prompt, /只发了个表情/);
+});
+
+test('别人发表情、或窗口关掉，都不触发', async () => {
+  const VISION = { enabled: true, contextWindowMs: 120000, maxImages: 2, maxBytes: 5242880 };
+  const agent = makeAgent('不该出现');
+  const bridge = makeBridge({ vision: VISION, agent,
+    behavior: { stickerReplyWindowMs: 60000 } }).bridge;
+  const stamp = Date.now();
+  await bridge.handleEvent({ group: '群A', sender: '张三', text: '@小助手 在吗', id: 'm1', seq: 1, timestamp: stamp / 1000 });
+  await bridge.flush();
+  await bridge.handleEvent({ group: '群A', sender: '李四', text: '动画表情', kind: 'sticker',
+    imageId: 'c'.repeat(32), id: 'm2', seq: 2, timestamp: stamp / 1000 });
+  await bridge.flush();
+  assert.equal(agent.calls.length, 1);
+
+  const off = makeBridge({ vision: VISION, agent: makeAgent('不该出现'),
+    behavior: { stickerReplyWindowMs: 0 } }).bridge;
+  await off.handleEvent({ group: '群A', sender: '王五', text: '@小助手 在吗', id: 'n1', seq: 1, timestamp: stamp / 1000 });
+  await off.flush();
+  await off.handleEvent({ group: '群A', sender: '王五', text: '动画表情', kind: 'sticker',
+    imageId: 'd'.repeat(32), id: 'n2', seq: 2, timestamp: stamp / 1000 });
+  await off.flush();
+  assert.equal(agent.calls.length, 1, '窗口为 0 时表情不该触发');
 });
