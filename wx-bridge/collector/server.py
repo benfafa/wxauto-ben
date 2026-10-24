@@ -26,6 +26,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from collector.stickers import StickerCatalog, StickerError
+from collector.inbox import Inbox
 from collector.tts import TtsError, normalize_tts, synthesize
 from collector.vision import ImageCache
 
@@ -81,7 +82,8 @@ class TtsJob:
 
 class CollectorService:
     def __init__(self, backend, token, *, allowed_groups=None, poll_ms=800,
-                 host="127.0.0.1", port=0, allow_inject=False, stickers=None, vision=None, tts=None):
+                 host="127.0.0.1", port=0, allow_inject=False, stickers=None, vision=None, tts=None,
+                 inbox=None):
         if not token:
             raise ValueError("collector token 不能为空")
         # backend 可以是实例（fake/测试），也可以是工厂函数（wxauto 必须在 UI 线程里构造，
@@ -104,6 +106,7 @@ class CollectorService:
         self.stickers = stickers if stickers is not None else StickerCatalog()
         self.images = ImageCache(vision)
         self.tts = tts if tts is not None else normalize_tts()
+        self.inbox = inbox if inbox is not None else Inbox()
 
         self.collector_id = uuid.uuid4().hex
         self._events = deque(maxlen=MAX_EVENTS)
@@ -181,7 +184,7 @@ class CollectorService:
                     self._backend_ready.set()
                     return
                 self._backend_ready.set()
-            self.backend.vision_enabled = self.images.config["enabled"]
+            self.backend.vision_enabled = self.images.config["enabled"] or self.inbox.cfg["enabled"]
             if self.backend.vision_enabled and getattr(self.backend, "mode", "") == "legacy":
                 logging.warning("legacy backend does not support image download; vision will degrade to text")
             while not self._stop.is_set():
@@ -226,6 +229,15 @@ class CollectorService:
                         continue
                     if self.images.config["enabled"] and event.get("kind") == "image":
                         event["imageId"] = self.images.register(event["group"], image_message)
+                    if image_message is not None and self.inbox.cfg["enabled"]:
+                        try:
+                            saved = self.inbox.save(image_message, event["group"], event.get("sender"))
+                            if saved:
+                                logging.info("inbox saved: group=%s file=%s bytes=%s",
+                                             event["group"], saved["file"], saved["bytes"])
+                        except Exception:
+                            # 收图失败不该影响消息投递。
+                            logging.warning("inbox save failed: group=%s", event.get("group"))
                     event.setdefault("id", f"event-{uuid.uuid4().hex}")
                     event["seq"] = self._next_seq
                     self._next_seq += 1
@@ -304,6 +316,7 @@ class CollectorService:
             "selfNickname": backend_health.get("selfNickname", ""),
             "groups": self.allowed_groups,
             "backendHealth": backend_health,
+            "inbox": self.inbox.status(),
         }
 
     def cursor(self):

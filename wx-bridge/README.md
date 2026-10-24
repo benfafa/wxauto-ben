@@ -364,6 +364,22 @@ collector 会再校验一次扩展名、magic、大小、真实路径和目录�
 
 触发是确定性的：只有消息里出现「用语音说」「发条语音」「念给我听」这类说法才走语音；「别发语音」不会触发。合成或发送失败会退回文字，不会让这条消息空着。`activity.jsonl` 记 `voice-sent` / `voice-error`。
 
+### inbox（可选，默认关闭）
+
+把群里收到的**普通图片**自动存进一个待整理目录，方便攒素材。它不是曲库：收进来的图不会出现在可发送索引里，仍然要本地打标、人工确认后再合并。
+
+| 字段 | 说明 | 默认 |
+| --- | --- | --- |
+| `enabled` | 是否收图 | `false` |
+| `directory` | 落盘目录，相对配置文件 | `inbox` |
+| `maxBytes` | 单张上限 | `5242880` |
+| `maxPerDay` | 每天最多收几张 | `50` |
+| `maxTotalMb` | 目录总量上限 | `500` |
+
+去重按 sha256，文件名就是前 16 位哈希；索引写在 `inbox/index.json`，`/health` 里的 `inbox` 能看到 `count/today/bytes`。
+
+**为什么只收普通图片**：微信 4.x 的「表情」消息（`type=emotion`）不落普通文件，本地缓存是加密 `.dat`（实测不是老版的首字节 XOR，解出来没有图片 magic），免费版 wxauto4 也没有 `EmotionMessage.download()`。所以表情包只能人工收藏，收件箱不碰它。
+
 ### stateDir
 
 `state/` 保存：
