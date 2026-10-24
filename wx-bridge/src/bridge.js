@@ -33,8 +33,22 @@ function localTimestamp(date = new Date()) {
     + `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
 }
 
+// 人格切换：默认损友，消息里带「喵」就切猫娘。确定性判断，不花 token，也不让
+// 模型自己选，避免同一个群里语气串味。
+const CATGIRL_KEYWORD = '喵';
+
+export function personaFor(text) {
+  return String(text ?? '').includes(CATGIRL_KEYWORD) ? '猫娘' : '损友';
+}
+
+function personaLine(persona) {
+  return persona === '猫娘'
+    ? `【本轮人格】猫娘 —— 对方这条消息里带了「${CATGIRL_KEYWORD}」，用傲娇猫娘的语气回。`
+    : '【本轮人格】损友 —— 用默认的嘴硬损友语气回，可以损，但守住人设里的底线。';
+}
+
 export function buildPrompt({ group, sender, text, context, memory = '（无）', stickers, vision, images = [],
-  conversation = false }) {
+  conversation = false, persona = '损友' }) {
   const safeText = truncateText(String(text ?? '').trim(), 4000) || '（空消息）';
   const imageNote = images.length
     ? `【本轮附图】共 ${images.length} 张，按时间先后：${images.map((image, index) => `第${index + 1}张由${oneLine(image.sender)}发送`).join('；')}。`
@@ -43,6 +57,7 @@ export function buildPrompt({ group, sender, text, context, memory = '（无）'
     : '';
   return [
     `【群名】${oneLine(group)}`,
+    personaLine(persona),
     `【发送者】${oneLine(sender)}`,
     `【接收时间】${localTimestamp()}`,
     '【被 @ 的消息】',
@@ -471,7 +486,7 @@ export class Bridge {
         const prompt = proactiveTurn
           ? buildProactivePrompt({ group, context, memory, stickers: this.cfg.stickers })
           : buildPrompt({ group, sender, text, context, memory, conversation: conversationTurn,
-            stickers: this.cfg.stickers, vision: this.cfg.vision, images: job.images });
+            persona: personaFor(text), stickers: this.cfg.stickers, vision: this.cfg.vision, images: job.images });
         this.log.info(proactiveTurn ? `主动插话回合：群「${group}」`
           : `调用 agent：群「${group}」 ${sender}：${truncateText(text, 80)}`);
         result = await this.agent.ask(group, prompt, { images });
