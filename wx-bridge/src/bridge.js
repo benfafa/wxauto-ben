@@ -494,8 +494,13 @@ export class Bridge {
         // A deterministic notice cannot hallucinate visual content from old context.
         result = { text: '未能读取图片，请用文字描述或稍后再试。' };
       } else {
-        if (refreshStickerIndex(this.cfg.stickers)) {
-          this.log.info(`表情包标签索引已热更新：${this.cfg.stickers.items.length} 张可用`);
+        try {
+          if (refreshStickerIndex(this.cfg.stickers)) {
+            this.log.info(`表情包标签索引已热更新：${this.cfg.stickers.items.length} 张可用`);
+          }
+        } catch (error) {
+          // 打标器正写索引时读到半截 JSON：沿用旧列表，别让这轮回复失败。
+          this.log.warn(`表情包标签索引热更新失败：${String(error?.message ?? error).slice(0, 160)}`);
         }
         const proactiveTurn = job.proactive === true;
         const conversationTurn = job.conversation === true;

@@ -288,6 +288,28 @@ test('主库与收件箱打标库合并，任一份变动都会热更新', () =>
     fs.utimesSync(extraFile, future, future);
     assert.equal(refreshStickerIndex(cfg), true);
     assert.deepEqual(cfg.items.map(({ id }) => id), ['001', '002', '003']);
+
+    // Main index wins for both duplicate files and conflicting IDs.
+    fs.writeFileSync(path.join(base, 'stickers', '001.png'), Buffer.from('fixture'));
+    fs.writeFileSync(extraFile, JSON.stringify({ ...extra,
+      '001.gif': { file: '001.gif', safe: true, caption: '重复文件', keywords: ['重复'] },
+      '001.png': { file: '001.png', safe: true, caption: '同名图片', keywords: ['重复'] }
+    }));
+    const later = new Date(Date.now() + 10000);
+    fs.utimesSync(extraFile, later, later);
+    assert.equal(refreshStickerIndex(cfg), true);
+    assert.equal(cfg.items.filter(({ file }) => file === '001.gif').length, 1);
+    assert.equal(cfg.items.find(({ id }) => id === '001').description, '熊猫头端碗');
+    assert.equal(new Set(cfg.items.map(({ id }) => id)).size, cfg.items.length);
+
+    fs.writeFileSync(extraFile, JSON.stringify({ ...extra,
+      '001.png': { file: '001.png', safe: true, caption: '同ID图片', keywords: ['重复'] }
+    }));
+    const last = new Date(Date.now() + 15000);
+    fs.utimesSync(extraFile, last, last);
+    assert.equal(refreshStickerIndex(cfg), true);
+    assert.deepEqual(cfg.items.map(({ id }) => id), ['001', '002']);
+    assert.equal(cfg.items[0].file, '001.gif');
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

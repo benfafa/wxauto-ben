@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -351,3 +352,61 @@ class StickerIndexTest(unittest.TestCase):
         self.index_file.write_text("{broken", encoding="utf-8")
         with self.assertRaises(json.JSONDecodeError):
             self.catalog()
+
+    def test_extra_index_is_merged_and_hot_reloaded_without_restart(self):
+        main = {"001.gif": {"file": "001.gif", "safe": True, "caption": "熊猫头端碗", "keywords": ["熊猫头"]}}
+        extra_file = self.base / "sticker-index-extra.json"
+        extra = {"002.png": {"file": "002.png", "safe": True, "caption": "猫猫坏笑", "keywords": ["猫"]}}
+        self.write_index(main)
+        extra_file.write_text(json.dumps(extra), encoding="utf-8")
+        catalog = self.catalog(extraIndexFile="sticker-index-extra.json")
+        self.assertEqual(sorted(catalog._files), ["001", "002"])
+        self.assertEqual(catalog.validate("002"), (self.directory / "002.png").resolve())
+
+        # 打标器发布新表情后，下一次发送就该认得它，不用重启 collector。
+        extra["003.png"] = {"file": "003.png", "safe": True, "caption": "新收的表情", "keywords": ["新"]}
+        extra_file.write_text(json.dumps(extra), encoding="utf-8")
+        future = 4102444800  # 2100-01-01, 保证 mtime 一定变化
+        os.utime(extra_file, (future, future))
+        self.assertEqual(catalog.validate("003"), (self.directory / "003.png").resolve())
+
+        # 重复文件以主库为准，不会被额外索引改名或覆盖。
+        extra["001.gif"] = {"file": "001.gif", "safe": True, "caption": "重复", "keywords": ["重复"]}
+        extra_file.write_text(json.dumps(extra), encoding="utf-8")
+        os.utime(extra_file, (future + 10, future + 10))
+        self.assertEqual(catalog._maybe_reload(), None)
+        self.assertEqual(catalog.validate("001"), (self.directory / "001.gif").resolve())
+
+    def test_extra_index_errors_keep_the_previous_whitelist(self):
+        self.write_index()
+        extra_file = self.base / "sticker-index-extra.json"
+        extra_file.write_text(json.dumps({"002.png": {
+            "file": "002.png", "safe": True, "caption": "猫猫", "keywords": ["猫"]}}), encoding="utf-8")
+        catalog = self.catalog(extraIndexFile="sticker-index-extra.json")
+        extra_file.write_text("{broken", encoding="utf-8")
+        future = 4102444800
+        os.utime(extra_file, (future, future))
+        self.assertEqual(catalog.validate("001"), (self.directory / "001.gif").resolve())
+        self.assertIn(f"002-{index_sha('002.png', 6)}", catalog._files)
+
+    def test_validation_keeps_one_mapping_during_concurrent_reload(self):
+        self.write_index()
+        catalog = self.catalog()
+        resolve = Path.resolve
+
+        def reload_during_resolution(value, *args, **kwargs):
+            if value == self.directory:
+                catalog._files = {}
+            return resolve(value, *args, **kwargs)
+
+        with patch.object(Path, "resolve", reload_during_resolution):
+            self.assertEqual(catalog.validate("001"), (self.directory / "001.gif").resolve())
+        with self.assertRaises(StickerError) as caught:
+            catalog.validate("001")
+        self.assertEqual(caught.exception.code, "unknown-sticker")
+
+    def test_extra_index_rejects_unsafe_paths_and_wrong_type(self):
+        with self.assertRaises(ValueError):
+            self.catalog(extraIndexFile="../outside.json")
+        with self.assertRaises(ValueError):
+            self.catalog(extraIndexFile=7)

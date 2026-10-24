@@ -249,7 +249,12 @@ function applyStickerIndex(stickers, indexItems) {
   const explicit = stickers.configuredItems ?? [];
   const taken = new Set(explicit.map((item) => item.id));
   const files = new Set(explicit.map((item) => item.file));
-  stickers.items = [...explicit, ...indexItems.filter((item) => !taken.has(item.id) && !files.has(item.file))];
+  stickers.items = [...explicit, ...indexItems.filter((item) => {
+    if (taken.has(item.id) || files.has(item.file)) return false;
+    taken.add(item.id);
+    files.add(item.file);
+    return true;
+  })];
 }
 
 function bigrams(value) {
@@ -308,11 +313,14 @@ function mtimeOf(file) {
 
 // 主库 + 收件箱打标库合成一份；重复的 id / 文件以主库为准。
 function loadStickerIndexes(stickers) {
+  // Snapshot before reading: a concurrent publication must remain detectable.
+  const mainMtime = mtimeOf(stickers.indexFile);
+  const extraMtime = mtimeOf(stickers.extraIndexFile);
   const main = stickers.indexFile ? readStickerIndex(stickers.indexFile, stickers.directory) : [];
   const extra = stickers.extraIndexFile ? readStickerIndex(stickers.extraIndexFile, stickers.directory) : [];
   applyStickerIndex(stickers, [...main, ...extra]);
-  stickers.indexMtimeMs = mtimeOf(stickers.indexFile);
-  stickers.extraIndexMtimeMs = mtimeOf(stickers.extraIndexFile);
+  stickers.indexMtimeMs = mainMtime;
+  stickers.extraIndexMtimeMs = extraMtime;
   return main.length + extra.length;
 }
 

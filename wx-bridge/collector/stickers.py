@@ -2,9 +2,11 @@
 
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
+import threading
 from pathlib import Path, PureWindowsPath
 
 MAX_STICKER_BYTES = 5 * 1024 * 1024
@@ -171,8 +173,16 @@ class StickerCatalog:
         if index_file is not None and index_file != "":
             self.index_file = (Path(base_dir or Path.cwd()).absolute()
                                / _relative_path(index_file, "stickers.indexFile"))
+        extra_index_file = config.get("extraIndexFile")
+        self.extra_index_file = None
+        if extra_index_file is not None and extra_index_file != "":
+            self.extra_index_file = (Path(base_dir or Path.cwd()).absolute()
+                                     / _relative_path(extra_index_file, "stickers.extraIndexFile"))
         self._root = None
         self._files = {}
+        self._explicit_files = {}
+        self._files_lock = threading.Lock()
+        self._index_stamp = None
         items = config.get("items", [])
         if not isinstance(items, list):
             raise ValueError("stickers.items must be an array")
@@ -192,24 +202,13 @@ class StickerCatalog:
                     or any(not isinstance(word, str) or not word.strip() for word in keywords)):
                 raise ValueError("stickers.items[].keywords must be nonempty strings")
             self._files[sticker_id] = file
-        # Explicit items always win; a label index replaces the auto-scan.
+            self._explicit_files[sticker_id] = file
         explicit_ids = set(self._files)
-        if self.enabled and self.index_file is not None:
-            explicit_files = {relative.as_posix() for relative in self._files.values()}
-            for item in index_sticker_items(self.index_file):
-                relative = item["file"]
-                if item["id"] in explicit_ids or relative.as_posix() in explicit_files:
-                    continue
-                # Same rule as Node: an entry whose image is gone is never offered.
-                if not (self.directory / relative).is_file():
-                    continue
-                self._files[item["id"]] = relative
-            if not self._files and self.auto_load:
-                for item in auto_sticker_items(self.directory):
-                    self._files[item["id"]] = item["file"]
-        elif self.enabled and not self._files and self.auto_load:
-            for item in auto_sticker_items(self.directory):
-                self._files[item["id"]] = item["file"]
+        if self.enabled:
+            # Snapshot before reading so a concurrent publication is picked up
+            # on the next validation rather than mistaken for an already loaded version.
+            self._index_stamp = self._read_index_stamp()
+            self._files = self._load_index_files()
         if self.enabled and self._files:
             self._root = self.directory.resolve(strict=True)
             if not self._root.is_dir():
@@ -218,6 +217,71 @@ class StickerCatalog:
             # validated per ID when a sticker is actually sent.
             for sticker_id in explicit_ids:
                 self.validate(sticker_id)
+
+    def _read_index_stamp(self):
+        stamp = []
+        for path in (self.index_file, self.extra_index_file):
+            try:
+                stamp.append(path.stat().st_mtime_ns if path is not None else None)
+            except OSError:
+                stamp.append(None)
+        return tuple(stamp)
+
+    def _load_index_files(self):
+        """合并显式 items、主索引和收件箱打标索引，规则与 src/stickers.js 一致。
+
+        主库优先于打标库；图片不在了的条目直接丢弃；只要配置了索引就不再扫描
+        目录兜底，除非索引一条可用条目都没有。
+        """
+        files = dict(self._explicit_files)
+        if self.index_file is not None or self.extra_index_file is not None:
+            taken_ids = set(files)
+            taken_files = {relative.as_posix() for relative in files.values()}
+            for index in (self.index_file, self.extra_index_file):
+                if index is None:
+                    continue
+                for item in index_sticker_items(index):
+                    relative = item["file"]
+                    if item["id"] in taken_ids or relative.as_posix() in taken_files:
+                        continue
+                    if not (self.directory / relative).is_file():
+                        continue
+                    files[item["id"]] = relative
+                    taken_ids.add(item["id"])
+                    taken_files.add(relative.as_posix())
+            if files or not self.auto_load:
+                return files
+            return {item["id"]: item["file"] for item in auto_sticker_items(self.directory)}
+        if not files and self.auto_load:
+            return {item["id"]: item["file"] for item in auto_sticker_items(self.directory)}
+        return files
+
+    def _maybe_reload(self):
+        """索引文件变了就换一份白名单：收件箱刚打标的表情不用重启就能发。"""
+        if not self.enabled:
+            return
+        if self.index_file is None and self.extra_index_file is None:
+            return
+        if self._read_index_stamp() == self._index_stamp:
+            return
+        with self._files_lock:
+            stamp = self._read_index_stamp()
+            if stamp == self._index_stamp:
+                return
+            try:
+                files = self._load_index_files()
+                root = self._root
+                if files and root is None:
+                    root = self.directory.resolve(strict=True)
+                if root is not None and not root.is_dir():
+                    raise ValueError("sticker directory is gone")
+            except (OSError, ValueError) as error:
+                # 索引可能正写到一半：保留现有白名单，下次发送再试。
+                logging.warning("sticker index reload skipped: %s", type(error).__name__)
+                return
+            self._files = files
+            self._root = root
+            self._index_stamp = stamp
 
     @classmethod
     def from_config_file(cls, file):
@@ -236,15 +300,19 @@ class StickerCatalog:
     def validate(self, sticker_id):
         if not self.enabled:
             raise StickerError("stickers-disabled", "本地表情包未启用", 403)
+        self._maybe_reload()
         if not isinstance(sticker_id, str) or not ID_RE.fullmatch(sticker_id):
             raise StickerError("invalid-sticker-id", "stickerId 格式非法")
-        if sticker_id not in self._files:
+        # Keep one immutable mapping snapshot throughout this validation: another
+        # HTTP/UI thread may atomically replace the catalog after the membership check.
+        files = self._files
+        if sticker_id not in files:
             raise StickerError("unknown-sticker", "stickerId 不在配置白名单中", 404)
         try:
             # Pin the root at startup; detect later directory/link replacement.
             if self.directory.resolve(strict=True) != self._root:
                 raise ValueError("sticker directory changed")
-            relative = self._files[sticker_id]
+            relative = files[sticker_id]
             file = (self.directory / relative).resolve(strict=True)
             if not file.is_relative_to(self._root):
                 raise ValueError("sticker resolves outside its directory")
