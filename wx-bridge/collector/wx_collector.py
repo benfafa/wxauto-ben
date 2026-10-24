@@ -31,6 +31,7 @@ from collector.backends.fake_backend import FakeBackend  # noqa: E402
 from collector.stickers import StickerCatalog  # noqa: E402
 from collector.tts import tts_from_file
 from collector.inbox import inbox_from_file
+from collector.labeler import StickerLabeler
 from collector.vision import vision_from_file  # noqa: E402
 
 
@@ -100,6 +101,9 @@ def main(argv=None):
             from collector.backends.wxauto_backend import WxAutoBackend
             return WxAutoBackend(groups)
 
+    inbox = inbox_from_file(args.config)
+    labeler = StickerLabeler(inbox, stickers,
+                             index_file=Path(args.config).absolute().parent / "sticker-index-extra.json")
     service = CollectorService(
         backend_source,
         token,
@@ -111,7 +115,8 @@ def main(argv=None):
         stickers=stickers,
         vision=vision_from_file(args.config),
         tts=tts_from_file(args.config),
-        inbox=inbox_from_file(args.config),
+        inbox=inbox,
+        labeler=labeler,
     )
 
     stop = threading.Event()

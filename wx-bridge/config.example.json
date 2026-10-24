@@ -52,7 +52,8 @@
     "cooldownMs": 0,
     "items": [],
     "indexFile": "sticker-index.json",
-    "shortlistLimit": 20
+    "shortlistLimit": 20,
+    "extraIndexFile": "sticker-index-extra.json"
   },
   "vision": {
     "enabled": false,
@@ -95,6 +96,9 @@
     "directory": "inbox",
     "maxBytes": 5242880,
     "maxPerDay": 50,
-    "maxTotalMb": 500
+    "maxTotalMb": 500,
+    "autoLabel": false,
+    "labelKeyFile": "",
+    "labelModel": "MiniMax-M3.1-Flash"
   }
 }

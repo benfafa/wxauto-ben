@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 from collector.stickers import StickerCatalog, StickerError
 from collector.inbox import Inbox
+from collector.labeler import StickerLabeler
 from collector.tts import TtsError, normalize_tts, synthesize
 from collector.vision import ImageCache
 
@@ -83,7 +84,7 @@ class TtsJob:
 class CollectorService:
     def __init__(self, backend, token, *, allowed_groups=None, poll_ms=800,
                  host="127.0.0.1", port=0, allow_inject=False, stickers=None, vision=None, tts=None,
-                 inbox=None):
+                 inbox=None, labeler=None):
         if not token:
             raise ValueError("collector token 不能为空")
         # backend 可以是实例（fake/测试），也可以是工厂函数（wxauto 必须在 UI 线程里构造，
@@ -107,6 +108,7 @@ class CollectorService:
         self.images = ImageCache(vision)
         self.tts = tts if tts is not None else normalize_tts()
         self.inbox = inbox if inbox is not None else Inbox()
+        self.labeler = labeler
 
         self.collector_id = uuid.uuid4().hex
         self._events = deque(maxlen=MAX_EVENTS)
@@ -165,6 +167,8 @@ class CollectorService:
 
     def _ui_loop(self):
         comtypes = None
+        if self.labeler is not None:
+            self.labeler.start()
         try:
             # wxauto4 uses COM UI Automation. Explicitly initialize the
             # worker apartment; constructing it without this works on the
@@ -207,6 +211,8 @@ class CollectorService:
                     self._handle_send(job)
         finally:
             self.images.close()
+            if self.labeler is not None:
+                self.labeler.stop()
             if comtypes is not None:
                 comtypes.CoUninitialize()
 
@@ -231,10 +237,14 @@ class CollectorService:
                         event["imageId"] = self.images.register(event["group"], image_message)
                     if image_message is not None and self.inbox.cfg["enabled"]:
                         try:
-                            saved = self.inbox.save(image_message, event["group"], event.get("sender"))
+                            saved = self.inbox.save(
+                                image_message, event["group"], event.get("sender"),
+                                kind="sticker" if event.get("kind") == "sticker" else "photo")
                             if saved:
-                                logging.info("inbox saved: group=%s file=%s bytes=%s",
-                                             event["group"], saved["file"], saved["bytes"])
+                                logging.info("inbox saved: group=%s kind=%s bytes=%s",
+                                             event["group"], saved["kind"], saved["bytes"])
+                                if saved["kind"] == "sticker" and self.labeler is not None:
+                                    self.labeler.submit(saved)
                         except Exception:
                             # 收图失败不该影响消息投递。
                             logging.warning("inbox save failed: group=%s", event.get("group"))

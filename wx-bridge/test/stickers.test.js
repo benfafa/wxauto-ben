@@ -266,3 +266,29 @@ test('shortlistLimit bounds the prompt and long captions are trimmed for the mod
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test('主库与收件箱打标库合并，任一份变动都会热更新', () => {
+  const files = ['001.gif', '002.png', '003.png'];
+  const { base } = makeStickerDir(files);
+  const main = { '001.gif': { file: '001.gif', safe: true, caption: '熊猫头端碗', keywords: ['熊猫头'] } };
+  const extra = { '002.png': { file: '002.png', safe: true, caption: '猫猫坏笑', keywords: ['猫'] } };
+  fs.writeFileSync(path.join(base, 'sticker-index.json'), JSON.stringify(main));
+  fs.writeFileSync(path.join(base, 'sticker-index-extra.json'), JSON.stringify(extra));
+  try {
+    const cfg = normalizeStickers({
+      enabled: true, directory: 'stickers',
+      indexFile: 'sticker-index.json', extraIndexFile: 'sticker-index-extra.json'
+    }, base);
+    assert.deepEqual(cfg.items.map(({ id }) => id), ['001', '002']);
+    assert.equal(refreshStickerIndex(cfg), false);
+    const extraFile = path.join(base, 'sticker-index-extra.json');
+    fs.writeFileSync(extraFile, JSON.stringify({ ...extra,
+      '003.png': { file: '003.png', safe: true, caption: '新收的表情', keywords: ['新'] } }));
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(extraFile, future, future);
+    assert.equal(refreshStickerIndex(cfg), true);
+    assert.deepEqual(cfg.items.map(({ id }) => id), ['001', '002', '003']);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

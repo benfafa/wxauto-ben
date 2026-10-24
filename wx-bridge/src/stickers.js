@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const DEFAULTS = { enabled: false, directory: 'stickers', cooldownMs: 0, autoLoad: true, items: [],
-  indexFile: null, shortlistLimit: 20 };
+  indexFile: null, extraIndexFile: null, shortlistLimit: 20 };
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const IMAGE_RE = /\.(jpe?g|png|gif)$/i;
 const AUTO_LIMIT = 200;
@@ -130,25 +130,25 @@ export function normalizeStickers(input = DEFAULTS, baseDir) {
   // can enable stickers before dropping images in.
   const indexFile = cfg.indexFile === null || cfg.indexFile === undefined || cfg.indexFile === ''
     ? null : path.resolve(baseDir, relativePath(cfg.indexFile, 'stickers.indexFile'));
+  // 收件箱里打标过的表情单独一份索引，和主库合并成同一个池子。
+  const extraIndexFile = cfg.extraIndexFile === null || cfg.extraIndexFile === undefined || cfg.extraIndexFile === ''
+    ? null : path.resolve(baseDir, relativePath(cfg.extraIndexFile, 'stickers.extraIndexFile'));
   const stickers = {
     enabled: cfg.enabled,
     directory,
     cooldownMs: cfg.cooldownMs,
     autoLoad: cfg.autoLoad,
     indexFile,
+    extraIndexFile,
     shortlistLimit: cfg.shortlistLimit,
     configuredItems: items,
     indexMtimeMs: null,
+    extraIndexMtimeMs: null,
     items
   };
-  if (cfg.enabled && indexFile) {
-    applyStickerIndex(stickers, readStickerIndex(indexFile, directory));
+  if (cfg.enabled && (indexFile || extraIndexFile)) {
+    loadStickerIndexes(stickers);
     if (!stickers.items.length && cfg.autoLoad) stickers.items = scanAutoItems(directory);
-    try {
-      stickers.indexMtimeMs = fs.statSync(indexFile).mtimeMs;
-    } catch {
-      stickers.indexMtimeMs = null;
-    }
   } else if (!items.length && cfg.enabled && cfg.autoLoad) {
     stickers.items = scanAutoItems(directory);
   }
@@ -297,18 +297,32 @@ export function shortlistStickers(stickers, { text = '', context = '', limit } =
     .map(({ item }) => brief(item));
 }
 
-// Hot-reload the label file so re-running the captioner takes effect without a restart.
-export function refreshStickerIndex(stickers) {
-  if (!stickers?.indexFile) return false;
-  let stats;
+function mtimeOf(file) {
   try {
-    stats = fs.statSync(stickers.indexFile);
+    const stats = fs.statSync(file);
+    return stats.isFile() ? stats.mtimeMs : null;
   } catch {
-    return false;
+    return null;
   }
-  if (!stats.isFile() || stats.mtimeMs === stickers.indexMtimeMs) return false;
-  applyStickerIndex(stickers, readStickerIndex(stickers.indexFile, stickers.directory));
-  stickers.indexMtimeMs = stats.mtimeMs;
+}
+
+// 主库 + 收件箱打标库合成一份；重复的 id / 文件以主库为准。
+function loadStickerIndexes(stickers) {
+  const main = stickers.indexFile ? readStickerIndex(stickers.indexFile, stickers.directory) : [];
+  const extra = stickers.extraIndexFile ? readStickerIndex(stickers.extraIndexFile, stickers.directory) : [];
+  applyStickerIndex(stickers, [...main, ...extra]);
+  stickers.indexMtimeMs = mtimeOf(stickers.indexFile);
+  stickers.extraIndexMtimeMs = mtimeOf(stickers.extraIndexFile);
+  return main.length + extra.length;
+}
+
+// Hot-reload both label files so新收的表情不用重启就能被选中。
+export function refreshStickerIndex(stickers) {
+  if (!stickers?.indexFile && !stickers?.extraIndexFile) return false;
+  const mainMtime = mtimeOf(stickers.indexFile);
+  const extraMtime = mtimeOf(stickers.extraIndexFile);
+  if (mainMtime === stickers.indexMtimeMs && extraMtime === stickers.extraIndexMtimeMs) return false;
+  loadStickerIndexes(stickers);
   return true;
 }
 

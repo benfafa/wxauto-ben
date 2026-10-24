@@ -21,6 +21,10 @@ DEFAULTS = {
     "maxBytes": 5 * 1024 * 1024,
     "maxPerDay": 50,
     "maxTotalMb": 500,
+    # 只给表情（截图）自动打标并并入曲库；普通图片只留在 inbox。
+    "autoLabel": False,
+    "labelKeyFile": "",
+    "labelModel": "MiniMax-M3.1-Flash",
 }
 
 MAGIC = (
@@ -41,6 +45,11 @@ def normalize_inbox(config=None):
     result = {**DEFAULTS, **config}
     if not isinstance(result["enabled"], bool):
         raise ValueError("inbox.enabled must be boolean")
+    if not isinstance(result["autoLabel"], bool):
+        raise ValueError("inbox.autoLabel must be boolean")
+    for name in ("labelKeyFile", "labelModel"):
+        if not isinstance(result[name], str):
+            raise ValueError(f"inbox.{name} must be a string")
     for key, minimum, maximum in (("maxBytes", 1024, 20 * 1024 * 1024),
                                   ("maxPerDay", 1, 2000),
                                   ("maxTotalMb", 10, 10000)):
@@ -91,6 +100,20 @@ class Inbox:
             return {}
         return value if isinstance(value, dict) else {}
 
+    def sticker_entries(self):
+        """还没打标的表情（按文件去重），给后台打标用。"""
+        return [dict(entry) for entry in self.index.values()
+                if isinstance(entry, dict) and entry.get("kind") == "sticker" and not entry.get("caption")]
+
+    def record_label(self, digest, label):
+        entry = self.index.get(digest)
+        if not isinstance(entry, dict):
+            return None
+        entry.update(label)
+        entry["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._persist()
+        return entry
+
     def _persist(self):
         self.directory.mkdir(parents=True, exist_ok=True)
         tmp = self.index_file.with_suffix(".tmp")
@@ -115,8 +138,8 @@ class Inbox:
             return False
         return status["bytes"] < self.cfg["maxTotalMb"] * 1024 * 1024
 
-    def save(self, message, group, sender):
-        """把一条普通图片消息存进收件箱。返回索引条目，跳过时返回 None。"""
+    def save(self, message, group, sender, kind="photo"):
+        """把一张图存进收件箱。kind='sticker' 才会进自动打标队列。返回索引条目。"""
         if not self.cfg["enabled"] or message is None:
             return None
         if not callable(getattr(message, "download", None)):
@@ -148,6 +171,7 @@ class Inbox:
                 "file": name,
                 "bytes": len(data),
                 "sha256": digest,
+                "kind": "sticker" if kind == "sticker" else "photo",
                 "group": str(group),
                 "sender": str(sender or ""),
                 "savedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),

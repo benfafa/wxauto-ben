@@ -298,6 +298,7 @@ wxauto 3.9 不提供结构化的 at 列表，只能看消息可见文本。最�
 | `items[].keywords` | 给模型看的用途关键词 | 必填 |
 | `items[].description` | 更细的语境描述，可选，≤500 字 | 空 |
 | `indexFile` | 视觉打标产出的 `sticker-index.json`（相对配置文件）；设了它就用索引当曲库，`autoLoad` 只在索引为空时兜底 | 空 |
+| `extraIndexFile` | 收件箱自动打标产出的第二份索引（相对配置文件），和主库合并成一个池子 | 空 |
 | `shortlistLimit` | 每轮从索引里挑多少张候选喂给模型（1~80） | `20` |
 
 `indexFile` 的搭配用法：`scripts/label-stickers-minimax.py` 在本地给图片生成 caption/keywords/mood/safe，`scripts/build-sticker-library.py` 过滤出可发布的一份（剔除 `safe:false`、被服务商拒审的、以及 `--drop 红包` 这类命中词），把 `stickers/` 和 `sticker-index.json` 一起放到服务器上，`directory` 指向前者、`indexFile` 指向后者。ID 由文件名决定，Node 与 collector 用同一套规则，改索引文件后无需重启（每轮自动热更新）。大曲库不会整份塞进提示词：本地先按关键词 + 描述二元字组粗筛，只把 `shortlistLimit` 张候选交给模型定夺。
@@ -380,6 +381,9 @@ collector 会再校验一次扩展名、magic、大小、真实路径和目录�
 | `maxBytes` | 单张上限 | `5242880` |
 | `maxPerDay` | 每天最多收几张 | `50` |
 | `maxTotalMb` | 目录总量上限 | `500` |
+| `autoLabel` | 是否给收进来的**表情**自动打标并发布到曲库（普通图片不处理） | `false` |
+| `labelKeyFile` | 打标用的 MiniMax Key 文件 | 空 |
+| `labelModel` | 打标模型 | `MiniMax-M3.1-Flash` |
 
 去重按 sha256，文件名就是前 16 位哈希；索引写在 `inbox/index.json`，`/health` 里的 `inbox` 能看到 `count/today/bytes`。
 
