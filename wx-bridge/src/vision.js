@@ -45,6 +45,7 @@ export class RecentImages {
     this.events.push({ group: event.group, sender: event.sender, imageId: event.imageId || null,
       timestamp: Number(event.timestamp) > 0 ? Number(event.timestamp) * 1000 : now, observedAt: now, seq: this.seq });
     this.events = this.events.slice(-500);
+    return this.seq;
   }
   // 梗常常是「甲发图、乙 @ 机器人吐槽」，所以取全群窗口内的图，只把触发者的图排在前面。
   candidates(group, sender, at, now = Date.now()) {

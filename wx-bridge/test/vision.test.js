@@ -45,6 +45,23 @@ test('metadata cache bounds, expires, excludes future/cross-group and applies ma
   cache.clear();
 });
 
+test('event identities survive missing image IDs and candidate snapshots stay isolated', () => {
+  const cache = new RecentImages({ enabled: true });
+  const event = { kind: 'image', group: 'A', sender: 'a', timestamp: 10 };
+  const first = cache.add(event, 10000);
+  const second = cache.add(event, 10000);
+  assert.notEqual(first, second);
+  const snapshot = cache.candidates('A', 'a', 10000, 10000);
+  assert.deepEqual(snapshot.map((item) => item.seq), [first, second]);
+  assert.deepEqual(snapshot.map((item) => item.imageId), [null, null]);
+  cache.add({ ...event, group: 'B', imageId: 'other' }, 10000);
+  cache.add({ ...event, imageId: 'new' }, 10000);
+  assert.deepEqual(snapshot.map((item) => item.seq), [first, second]);
+  assert.deepEqual(cache.candidates('A', 'a', 10000, 10000).map((item) => item.imageId), [null, 'new']);
+  cache.clear();
+  assert.notEqual(cache.add(event, 10000), first);
+});
+
 // 梗图常见形态是「甲发图、乙 @ 机器人接梗」，所以别人的图也要能带上，但自己的优先。
 test('carries other members images and prefers the trigger sender, oldest first', () => {
   const cache = new RecentImages({ enabled: true, contextWindowMs: 10000, maxImages: 2 });

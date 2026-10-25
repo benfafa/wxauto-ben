@@ -351,7 +351,7 @@ test('an image event with visible @ can include itself', async () => {
   assert.deepEqual(agent.calls[0].options.images, [inlineImage]);
 });
 
-test('image retrieval failure uses a local text notice without calling the model or logging data', async () => {
+test('image retrieval failure stays silent without calling the model or logging data', async () => {
   const logs = [];
   const { bridge, agent, collector } = makeBridge({ vision: { enabled: true },
     logger: { ...quietLogger, warn: (s) => logs.push(s) } });
@@ -359,25 +359,137 @@ test('image retrieval failure uses a local text notice without calling the model
   await bridge.handleEvent({ ...stickerEvent, kind: 'image', imageId: 'bad' });
   await bridge.flush();
   assert.equal(agent.calls.length, 0);
-  assert.equal(collector.sent.length, 1);
-  assert.equal(collector.sent[0].text, '未能读取图片，请用文字描述或稍后再试。');
+  assert.equal(collector.sent.length, 0);
+  assert.equal(bridge.lastReplyTo.size, 0);
   assert.ok(!JSON.stringify(logs).includes('SECRET_BASE64'));
 });
 
-test('model image refusal is not retried and sends a safe text notice regardless of sendErrorNotice', async () => {
+test('model image failure stays silent and is not retried even with sendErrorNotice', async () => {
   const logs = [];
   const agent = makeAgent();
   agent.ask = async (...args) => { agent.calls.push(args); throw new Error('SECRET_BASE64'); };
-  const { bridge, collector } = makeBridge({ agent, vision: { enabled: true },
-    logger: { ...quietLogger, warn: (s) => logs.push(s) } });
+  const { bridge, collector } = makeBridge({ agent, vision: { enabled: true }, behavior: { sendErrorNotice: true },
+    logger: Object.fromEntries(Object.keys(quietLogger).map((key) => [key, (s) => logs.push(s)])) });
   collector.image = async () => inlineImage;
   await bridge.handleEvent({ ...stickerEvent, kind: 'image', imageId: 'bad' });
   await bridge.flush();
   assert.equal(agent.calls.length, 1);
-  assert.equal(collector.sent.length, 1);
-  assert.match(collector.sent[0].text, /未能读取图片/);
-  assert.ok(logs.some((s) => s.includes('模型拒绝')));
+  assert.equal(collector.sent.length, 0);
+  assert.equal(bridge.lastReplyTo.size, 0);
+  assert.equal(bridge.lastSentByGroup.size, 0);
+  assert.ok(logs.some((s) => typeof s === 'string' && s.includes('图片回合处理失败')));
+  assert.ok(!logs.some((s) => s?.type === 'reply'));
   assert.ok(!JSON.stringify(logs).includes('SECRET_BASE64'));
+});
+
+test('bad background images are skipped with matching ordered metadata and bytes', async () => {
+  for (const mode of ['fetch', 'validation']) {
+    const logs = [];
+    const { bridge, agent, collector } = makeBridge({ vision: { enabled: true, maxImages: 4 },
+      logger: Object.fromEntries(Object.keys(quietLogger).map((key) => [key, (s) => logs.push(s)])) });
+    const fetched = [];
+    collector.image = async ({ imageId }) => {
+      fetched.push(imageId);
+      if (imageId === 'bad') {
+        if (mode === 'fetch') throw new Error('SECRET_BASE64');
+        return { ...inlineImage, data: 'SECRET_BASE64' };
+      }
+      return { ...inlineImage, name: `${imageId}.png` };
+    };
+    const now = Date.now() / 1000;
+    for (const [id, sender, age] of [['bad', '旧图者', 3], ['good', '背景者', 2]]) {
+      await bridge.handleEvent({ group: '群A', sender, kind: 'image', text: '[图片]', id, imageId: id, timestamp: now - age });
+    }
+    await bridge.handleEvent({ ...stickerEvent, kind: 'image', imageId: 'target', timestamp: now });
+    await bridge.flush();
+    assert.deepEqual(fetched, ['bad', 'good', 'target']);
+    assert.equal(agent.calls.length, 1);
+    assert.deepEqual(agent.calls[0].options.images.map((image) => image.name), ['good.png', 'target.png']);
+    assert.match(agent.calls[0].prompt, /共 2 张，按时间先后：第1张由背景者发送；第2张由张三发送/);
+    assert.match(agent.calls[0].prompt, /部分背景图缺失/);
+    assert.match(agent.calls[0].prompt, /不能把上下文所有图片占位与现有附图一一对应/);
+    assert.equal(collector.sent.length, 1);
+    assert.ok(!JSON.stringify(logs).includes('SECRET_BASE64'));
+  }
+});
+
+test('unavailable visual targets never substitute an older image or count a reply', async () => {
+  for (const mode of ['current-bad', 'missing-id', 'sticker-missing-id', 'excluded', 'text-target', 'all-bad']) {
+    const logs = [];
+    const { bridge, agent, collector } = makeBridge({ vision: { enabled: true, maxImages: 2 },
+      behavior: { sendErrorNotice: true },
+      logger: Object.fromEntries(Object.keys(quietLogger).map((key) => [key, (s) => logs.push(s)])) });
+    collector.image = async ({ imageId }) => {
+      if (imageId === 'bad' || mode === 'all-bad') throw new Error('SECRET_BASE64');
+      return inlineImage;
+    };
+    const now = Date.now() / 1000;
+    await bridge.handleEvent({ group: '群A', sender: '李四', kind: 'image', text: '[图片]', id: 'old', imageId: 'good', timestamp: now - 3 });
+    if (mode === 'text-target') {
+      await bridge.handleEvent({ group: '群A', sender: '张三', kind: 'image', text: '[图片]', id: 'target', imageId: 'bad', timestamp: now - 1 });
+      await bridge.handleEvent({ ...stickerEvent, timestamp: now });
+    } else {
+      // Unknown senders are not cached, but their visual event must remain a target.
+      await bridge.handleEvent({ ...stickerEvent, sender: mode === 'excluded' ? '未知' : '张三',
+        kind: mode === 'sticker-missing-id' ? 'sticker' : 'image',
+        imageId: mode.includes('missing-id') ? undefined : 'bad', timestamp: now });
+    }
+    await bridge.flush();
+    assert.equal(agent.calls.length, 0, mode);
+    assert.equal(collector.sent.length, 0, mode);
+    assert.equal(bridge.lastReplyTo.size, 0, mode);
+    assert.equal(bridge.lastSentByGroup.size, 0, mode);
+    assert.ok(!logs.some((s) => s?.type === 'reply'), mode);
+    assert.ok(!JSON.stringify(logs).includes('SECRET_BASE64'), mode);
+  }
+});
+
+test('text mentions use the latest own candidate while skipping older failed images', async () => {
+  const { bridge, agent, collector } = makeBridge({ vision: { enabled: true } });
+  collector.image = async ({ imageId }) => {
+    if (imageId === 'old') throw new Error('SECRET_BASE64');
+    return inlineImage;
+  };
+  const now = Date.now() / 1000;
+  for (const [id, age] of [['old', 2], ['new', 1]]) {
+    await bridge.handleEvent({ group: '群A', sender: '张三', kind: 'image', text: '[图片]', id, imageId: id, timestamp: now - age });
+  }
+  await bridge.handleEvent({ ...stickerEvent, timestamp: now });
+  await bridge.flush();
+  assert.equal(agent.calls.length, 1);
+  assert.deepEqual(agent.calls[0].options.images, [inlineImage]);
+  assert.match(agent.calls[0].prompt, /共 1 张，按时间先后：第1张由张三发送/);
+  assert.match(agent.calls[0].prompt, /部分背景图缺失/);
+  assert.equal(collector.sent.length, 1);
+});
+
+test('conversation visual follow-ups attach the current image and silently skip missing IDs', async () => {
+  const { bridge, agent, collector } = makeBridge({ vision: { enabled: true },
+    conversation: { enabled: true, triggerMentions: 2, windowMs: 60000, idleTimeoutMs: 300000, maxTurns: 40, groups: [] } });
+  await bridge.handleEvent(stickerEvent);
+  await bridge.handleEvent({ ...stickerEvent, id: 'second-mention', text: '@小助手 再聊聊' });
+  await bridge.flush();
+  await bridge.handleEvent({ group: '群A', sender: '张三', kind: 'image', text: '[图片]', imageId: 'current', id: 'follow' });
+  await bridge.flush();
+  assert.equal(agent.calls.length, 3);
+  assert.equal(agent.calls[2].options.images.length, 1);
+  assert.equal(collector.sent[2].at, null);
+  const lastReply = bridge.lastReplyTo.get('群A');
+  await bridge.handleEvent({ group: '群A', sender: '张三', kind: 'image', text: '[图片]', id: 'missing' });
+  await bridge.flush();
+  assert.equal(agent.calls.length, 3);
+  assert.equal(collector.sent.length, 3);
+  assert.equal(bridge.lastReplyTo.get('群A'), lastReply);
+});
+
+test('text errors retain the configured error notice', async () => {
+  const agent = makeAgent();
+  agent.ask = async () => { throw new Error('text failure'); };
+  const { bridge, collector } = makeBridge({ agent, behavior: { sendErrorNotice: true } });
+  await bridge.handleEvent(stickerEvent);
+  await bridge.flush();
+  assert.equal(collector.sent.length, 1);
+  assert.equal(collector.sent[0].text, '这条消息处理失败了，请稍后再试。');
 });
 
 test('invalid control JSON is never sent; model null respects no-image request', async () => {
