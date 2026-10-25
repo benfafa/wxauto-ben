@@ -267,11 +267,16 @@ class CollectorService:
         sticker_id = job.sticker_id if isinstance(job, StickerJob) else None
         try:
             if isinstance(job, TtsJob):
-                result = self.backend.send_file(job.group, str(job.path), what="语音")
+                native = bool(self.tts.get("nativeVoice")) and bool(getattr(self.backend, "supports_voice", False))
+                if native:
+                    # 原生气泡：按住说话 + 虚拟声卡，由后端完成并校验送达。
+                    result = self.backend.send_voice(job.group, str(job.path))
+                else:
+                    result = self.backend.send_file(job.group, str(job.path), what="语音")
                 if not isinstance(result, dict) or result.get("ok") is not True:
                     raise RuntimeError("voice send was not confirmed")
-                logging.info("voice sent: group=%s bytes=%s", job.group, job.size)
-                result = {"ok": True, "bytes": job.size}
+                logging.info("voice sent: group=%s bytes=%s native=%s", job.group, job.size, native)
+                result = {"ok": True, "bytes": job.size, "native": native}
             elif isinstance(job, StickerJob):
                 file = self.stickers.validate(sticker_id)
                 result = self.backend.send_sticker(job.group, str(file), sticker_id)

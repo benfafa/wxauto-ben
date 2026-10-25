@@ -15,7 +15,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from collector.backends.fake_backend import FakeBackend  # noqa: E402
-from collector.server import CollectorService, StickerJob  # noqa: E402
+from collector.server import CollectorService, StickerJob, TtsJob  # noqa: E402
+from collector.tts import normalize_tts  # noqa: E402
 from collector.stickers import StickerCatalog  # noqa: E402
 
 TOKEN = "0123456789abcdef0123456789abcdef"
@@ -264,3 +265,44 @@ class InjectDisabledTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TtsJobRoutingTest(unittest.TestCase):
+    """TTS 走原生气泡还是文件，取决于配置和后端能力。"""
+
+    def _run(self, *, native, supports_voice):
+        called = []
+
+        class Backend:
+            def send_voice(self, group, path):
+                called.append(("voice", group))
+                return {"ok": True}
+
+            def send_file(self, group, path, what="文件"):
+                called.append(("file", group))
+                return {"ok": True}
+
+            def send(self, group, text, at=None):
+                return {"ok": True}
+
+        backend = Backend()
+        backend.supports_voice = supports_voice
+        service = CollectorService(
+            backend, "0" * 32, allowed_groups=["测试群"],
+            tts=normalize_tts({"enabled": True, "nativeVoice": native}))
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        path = folder / ("reply.wav" if native else "reply.mp3")
+        path.write_bytes(b"x")
+        job = TtsJob(group="测试群", path=path, folder=folder, size=1, future=Future())
+        service._handle_send(job)
+        return called, job.future
+
+    def test_native_voice_needs_backend_support(self):
+        self.assertEqual(self._run(native=True, supports_voice=True)[0], [("voice", "测试群")])
+        self.assertEqual(self._run(native=True, supports_voice=False)[0], [("file", "测试群")])
+        self.assertEqual(self._run(native=False, supports_voice=True)[0], [("file", "测试群")])
+
+    def test_native_voice_reports_native_flag(self):
+        called, future = self._run(native=True, supports_voice=True)
+        self.assertTrue(future.result()["native"])

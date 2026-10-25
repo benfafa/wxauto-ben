@@ -4,6 +4,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,22 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from collector import tts as mod
+
+WAV_RATE = 24000
+
+
+def _wav_bytes(seconds=0.2, rate=WAV_RATE):
+    frames = int(rate * seconds)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(bytes([0, 1]) * frames)
+    return buffer.getvalue()
+
+
+WAV = _wav_bytes()
 
 MP3 = b"ID3\x04\x00" + b"\x00" * 64
 
@@ -22,8 +39,10 @@ class TtsConfigTest(unittest.TestCase):
         self.assertFalse(cfg["enabled"])
         self.assertEqual(cfg["provider"], "minimax")
         self.assertEqual(cfg["maxChars"], 300)
+        self.assertFalse(cfg["nativeVoice"])
         for bad in ({"provider": "azure"}, {"maxChars": 0}, {"maxBytes": 10}, {"timeoutMs": 100},
-                    {"speed": 3}, {"pitch": 13}, {"enabled": "yes"}, {"typo": 1}, []):
+                    {"speed": 3}, {"pitch": 13}, {"enabled": "yes"}, {"nativeVoice": "yes"},
+                    {"typo": 1}, []):
             with self.assertRaises(ValueError):
                 mod.normalize_tts(bad)
 
@@ -78,6 +97,31 @@ class TtsSynthesizeTest(unittest.TestCase):
             self.assertEqual(path.parent, folder)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
+
+    def test_native_voice_requests_wav_and_keeps_pcm(self):
+        body = json.dumps({"base_resp": {"status_code": 0}, "data": {"audio": WAV.hex()}})
+        calls = []
+
+        def fake_urlopen(request, *args, **kwargs):
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return self._response(body)
+
+        with patch("collector.tts.urllib.request.urlopen", side_effect=fake_urlopen):
+            path, folder = mod.synthesize(self._cfg(nativeVoice=True), "说句话")
+        try:
+            self.assertEqual(calls[0]["audio_setting"]["format"], "wav")
+            self.assertEqual(path.suffix, ".wav")
+            self.assertEqual(path.read_bytes(), WAV)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_native_voice_rejects_mp3_payload_and_edge(self):
+        body = json.dumps({"base_resp": {"status_code": 0}, "data": {"audio": MP3.hex()}})
+        with patch("collector.tts.urllib.request.urlopen", return_value=self._response(body)):
+            with self.assertRaises(mod.TtsError):
+                mod.synthesize(self._cfg(nativeVoice=True), "你好")
+        with self.assertRaises(mod.TtsError):
+            mod.synthesize(self._cfg(nativeVoice=True, provider="edge"), "你好")
 
     def test_rejects_non_audio_payload(self):
         body = json.dumps({"base_resp": {"status_code": 0}, "data": {"audio": b"not-mp3".hex()}})

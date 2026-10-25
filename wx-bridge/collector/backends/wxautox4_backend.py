@@ -103,11 +103,17 @@ class ImageHandle:
         return str(newest)
 
 
+def _is_com_event_error(error):
+    """UIA 事件订阅失效：窗口重建后旧订阅还在，COM 抛 0x80040201。"""
+    text = str(error)
+    return "-2147220991" in text or "事件无法调用任何订户" in text         or "unable to invoke" in text.lower()
+
+
 def _load_wechat(debug=False):
     from wxautox4 import WeChat
 
     # ``ads`` 是 wxauto4 的参数，wxautox4-open 用 **kwargs 吞掉，保持调用一致。
-    return WeChat(ads=False, debug=debug)
+    return WeChat(ads=False, debug=debug, resize=False)
 
 
 class WxAutoX4Backend:
@@ -132,6 +138,7 @@ class WxAutoX4Backend:
         self._image_dir = Path(tempfile.gettempdir()) / "wxautox4-images"
 
         factory = wechat_factory or _load_wechat
+        self._factory = factory
         self.wx = factory(debug=self.debug)
         self.self_nickname = str(getattr(self.wx, "nickname", "") or "")
         if not self.self_nickname:
@@ -328,10 +335,19 @@ class WxAutoX4Backend:
         result = self.send_file(group, filepath, what="图片")
         return {**result, "stickerId": sticker_id}
 
-    def send_voice(self, group, filepath):
-        """Send a native voice bubble (requires a virtual cable, see SendAudio)."""
-        if group not in self.groups:
-            raise ValueError(f"group not allowed: {group}")
+    def _rebuild(self):
+        """Drop cached UIA handles and re-attach after a COM event failure."""
+        with self._state_lock:
+            self.chats.clear()
+            self.fallback.clear()
+        try:
+            self.wx = self._factory(debug=self.debug)
+        except Exception:
+            return
+        for group in self.groups:
+            self._ensure_chat(group)
+
+    def _send_voice_once(self, group, filepath):
         target = self._chat_target(group)
         before = self._self_signature(target)
         if hasattr(target, "SendAudio"):
@@ -342,3 +358,16 @@ class WxAutoX4Backend:
         if not self._wait_until_delivered(target, before):
             raise RuntimeError("语音未确认送达：微信里没有出现新的语音气泡")
         return {"ok": True, "delivered": True, "voice": True}
+
+    def send_voice(self, group, filepath):
+        """Send a native voice bubble, rebuilding the UIA session once on COM errors."""
+        if group not in self.groups:
+            raise ValueError(f"group not allowed: {group}")
+        try:
+            return self._send_voice_once(group, filepath)
+        except Exception as error:
+            if not _is_com_event_error(error):
+                raise
+            self.errors[group] = "UIA 事件订阅失效，已重建窗口重试"
+            self._rebuild()
+            return self._send_voice_once(group, filepath)

@@ -5,6 +5,7 @@
 唯一那条 UI 线程上，两者不混。
 """
 
+import io
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import ssl
 import tempfile
 import urllib.error
 import urllib.request
+import wave
 from pathlib import Path
 
 DEFAULTS = {
@@ -25,6 +27,8 @@ DEFAULTS = {
     "maxChars": 300,
     "maxBytes": 5 * 1024 * 1024,
     "timeoutMs": 60000,
+    # 发微信原生语音气泡（而不是 mp3 文件）：需要能出 WAV 的后端 + 虚拟声卡。
+    "nativeVoice": False,
 }
 
 PROVIDERS = ("minimax", "edge")
@@ -44,6 +48,8 @@ def normalize_tts(config=None):
     result = {**DEFAULTS, **config}
     if not isinstance(result["enabled"], bool):
         raise ValueError("tts.enabled must be boolean")
+    if not isinstance(result["nativeVoice"], bool):
+        raise ValueError("tts.nativeVoice must be boolean")
     if result["provider"] not in PROVIDERS:
         raise ValueError(f"tts.provider must be one of {', '.join(PROVIDERS)}")
     for name, minimum, maximum in (("maxChars", 1, 2000), ("maxBytes", 1024, 20 * 1024 * 1024),
@@ -105,13 +111,22 @@ def _read_key(path):
     return key
 
 
-def _check_audio(data, max_bytes):
-    if b"RIFF" in data[:4] and data[8:12] == b"WAVE":
-        okay = True
-    else:
-        okay = data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
+def _check_audio(data, max_bytes, want_wav=False):
+    is_wav = data[:4] == b"RIFF" and data[8:12] == b"WAVE"
+    okay = is_wav or (data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0))
     if not okay:
         raise TtsError("合成结果不是 mp3/wav")
+    if want_wav:
+        if not is_wav:
+            raise TtsError("TTS 没有返回 WAV，无法发原生语音")
+        try:
+            with wave.open(io.BytesIO(data)) as handle:
+                if handle.getsampwidth() != 2:
+                    raise TtsError("WAV 不是 16-bit PCM，无法发原生语音")
+                if handle.getframerate() < 8000:
+                    raise TtsError("WAV 采样率过低")
+        except wave.Error as error:
+            raise TtsError(f"WAV 解析失败：{error}") from error
     if not 0 < len(data) <= max_bytes:
         raise TtsError(f"合成音频超出 {max_bytes} 字节上限")
     return data
@@ -119,12 +134,14 @@ def _check_audio(data, max_bytes):
 
 def _synth_minimax(cfg, text, timeout):
     key = _read_key(cfg["keyFile"])
+    want_wav = bool(cfg.get("nativeVoice"))
     payload = {
         "model": cfg["model"],
         "text": text,
         "stream": False,
         "voice_setting": {"voice_id": cfg["voice"], "speed": cfg["speed"], "vol": 1, "pitch": cfg["pitch"]},
-        "audio_setting": {"sample_rate": 32000, "bitrate": 128000, "format": "mp3", "channel": 1},
+        "audio_setting": {"sample_rate": 24000 if want_wav else 32000, "bitrate": 128000,
+                          "format": "wav" if want_wav else "mp3", "channel": 1},
     }
     request = urllib.request.Request(
         MINIMAX_URL,
@@ -175,10 +192,12 @@ def synthesize(cfg, text):
     if not spoken:
         raise TtsError("可朗读的文字为空")
     timeout = cfg["timeoutMs"] / 1000
+    if cfg["nativeVoice"] and cfg["provider"] != "minimax":
+        raise TtsError("原生语音需要 minimax（edge 只输出 mp3）")
     data = _synth_minimax(cfg, spoken, timeout) if cfg["provider"] == "minimax" \
         else _synth_edge(cfg, spoken, timeout)
-    _check_audio(data, cfg["maxBytes"])
+    _check_audio(data, cfg["maxBytes"], want_wav=cfg["nativeVoice"])
     folder = Path(tempfile.mkdtemp(prefix="wx-bridge-tts-"))
-    path = folder / "reply.mp3"
+    path = folder / ("reply.wav" if cfg["nativeVoice"] else "reply.mp3")
     path.write_bytes(data)
     return path, folder

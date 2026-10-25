@@ -14,7 +14,9 @@ const DEFAULTS = {
   pitch: 2,
   maxChars: 300,
   maxBytes: 5 * 1024 * 1024,
-  timeoutMs: 60000
+  timeoutMs: 60000,
+  // 发微信原生语音气泡（不是 mp3 文件）：合成在采集端，这里只校验开关。
+  nativeVoice: false
 };
 
 function requireInt(value, label, min, max) {
@@ -33,6 +35,7 @@ export function normalizeTts(input) {
   if (unknown.length) throw new Error(`tts 含未知字段：${unknown.join(', ')}`);
   const cfg = { ...DEFAULTS, ...input };
   if (typeof cfg.enabled !== 'boolean') throw new Error('tts.enabled 必须是布尔值');
+  if (typeof cfg.nativeVoice !== 'boolean') throw new Error('tts.nativeVoice 必须是布尔值');
   if (!['minimax', 'edge'].includes(cfg.provider)) throw new Error('tts.provider 只能是 minimax 或 edge');
   requireInt(cfg.maxChars, 'tts.maxChars', 1, 2000);
   requireInt(cfg.maxBytes, 'tts.maxBytes', 1024, 20 * 1024 * 1024);

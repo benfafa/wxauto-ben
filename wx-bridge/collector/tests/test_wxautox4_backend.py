@@ -315,5 +315,45 @@ class FallbackTest(unittest.TestCase):
         self.assertEqual(fake.sent[-1], ("hi", "群A", None, True))
 
 
+class ComRetryTest(unittest.TestCase):
+    def test_rebuilds_once_on_com_event_error(self):
+        class FlakyChat(FakeChat):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def SendAudio(self, filepath):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("COMError: (-2147220991, '事件无法调用任何订户')")
+                return super().SendAudio(filepath)
+
+        first = FlakyChat()
+        second = FakeChat()
+        chats = {"群A": first}
+        created = []
+
+        def factory(debug=False):
+            created.append(1)
+            return FakeWeChat(chats)
+
+        backend = WxAutoX4Backend(["群A"], wechat_factory=factory)
+        backend.delivery_wait_seconds = 0.5
+        chats["群A"] = second          # 重建后 GetSubWindow 拿到新窗口
+        result = backend.send_voice("群A", "v.wav")
+        self.assertTrue(result["voice"])
+        self.assertEqual(second.audios, ["v.wav"])
+        self.assertEqual(len(created), 2)  # 初始一次 + 重建一次
+
+    def test_other_errors_are_not_retried(self):
+        class BrokenChat(FakeChat):
+            def SendAudio(self, filepath):
+                raise RuntimeError("boom")
+
+        backend, _ = make_backend({"群A": BrokenChat()})
+        with self.assertRaises(RuntimeError):
+            backend.send_voice("群A", "v.wav")
+
+
 if __name__ == "__main__":
     unittest.main()
