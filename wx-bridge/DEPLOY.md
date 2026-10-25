@@ -144,6 +144,13 @@ Invoke-RestMethod 'http://127.0.0.1:8765/health' -Headers $h | ConvertTo-Json -C
 
 - `wechat.token`：只在本机回环上用的 Bearer，≥16 位随机串；不要复用别处的口令。
 - `wechat.mentionAliases`：群里 @ 出来的是**群昵称**，常见坑是填了账号昵称导致永远不触发。
+
+- `wechat.backend`（可选）：`wxauto`（默认，wxauto4）或 `wxautox4`（wxautox4-open）。
+  `wxautox4` 多出原生语音气泡能力，但**要求 Windows 默认麦克风是虚拟声卡输出端**，
+  且服务器必须装有音频端点；缺失时发送会明确失败，不会发空白语音。
+  命令行的 `--backend` 优先于该字段。适配层处理了三处 API 差异：
+  `chat_info` 是方法、`download()` 只返回目录、`GetAllMessage()` 只读当前会话
+  （子窗口不可用的会话自动回退到主窗口切换读取）。
 - `behavior.requireMention`：`true` 时只回 @；主动插话是独立开关，不受它影响。
 - `stickers`：`indexFile` 指向索引，`shortlistLimit` 控制每轮喂给模型多少张候选（默认 20），
   大曲库靠本地粗筛，不会把 800 条塞进提示词。

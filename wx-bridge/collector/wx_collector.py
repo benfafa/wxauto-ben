@@ -48,7 +48,8 @@ def load_wechat_config(path):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="WeChat collector for wx-bridge")
     parser.add_argument("--config", default="config.json", help="与 bridge 共用的 config.json")
-    parser.add_argument("--backend", choices=["wxauto", "fake"], default="wxauto")
+    parser.add_argument("--backend", choices=["wxauto", "wxautox4", "fake"], default="",
+                        help="默认读 config.wechat.backend，再退回 wxauto")
     parser.add_argument("--groups", default="", help="逗号分隔的群名；不填则读 config.wechat.groups")
     parser.add_argument("--token", default="", help="覆盖 config.wechat.token")
     parser.add_argument("--host", default="127.0.0.1")
@@ -93,8 +94,17 @@ def main(argv=None):
 
     poll_ms = args.poll_ms or int(wechat.get("pollMs") or 800)
 
-    if args.backend == "fake":
+    backend_name = (args.backend or str(wechat.get("backend") or "wxauto")).strip().lower()
+    if backend_name not in ("wxauto", "wxautox4", "fake"):
+        raise SystemExit(f"未知的 wechat.backend：{backend_name}（可选 wxauto / wxautox4 / fake）")
+
+    if backend_name == "fake":
         backend_source = FakeBackend(groups, send_log=args.send_log or None)
+    elif backend_name == "wxautox4":
+        def backend_source():
+            # 必须在这个 UI worker 线程里构造 COM/UIA 对象。
+            from collector.backends.wxautox4_backend import WxAutoX4Backend
+            return WxAutoX4Backend(groups)
     else:
         def backend_source():
             # 必须在这个 UI worker 线程里构造 wxauto/COM 对象。
@@ -111,7 +121,7 @@ def main(argv=None):
         poll_ms=poll_ms,
         host=args.host,
         port=port,
-        allow_inject=args.allow_inject and args.backend == "fake",
+        allow_inject=args.allow_inject and backend_name == "fake",
         stickers=stickers,
         vision=vision_from_file(args.config),
         tts=tts_from_file(args.config),
