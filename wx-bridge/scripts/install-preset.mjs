@@ -19,8 +19,6 @@ import yaml from 'js-yaml';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const PRESET_SOURCE = path.join(ROOT, 'preset', 'wx-chat.preset.yml');
-const GUARD_SOURCE = path.join(ROOT, 'preset', 'wx-bridge-tool-guard.mjs');
-const GUARD_NAME = 'wx-bridge-tool-guard.mjs';
 const BEGIN = '# === wx-bridge preset BEGIN ===';
 const END = '# === wx-bridge preset END ===';
 const PROFILE_NAME_RE = /^[A-Za-z0-9._-]+$/;
@@ -40,10 +38,6 @@ export function loadPresetRow(file = PRESET_SOURCE) {
   }
   const persona = row.config.plugins.find((plugin) => plugin?.id === 'persona');
   if (!persona) fail(`${file}: 缺少 persona 行`);
-  const guard = row.config.plugins.find((plugin) => plugin?.id === 'wx-tool-guard');
-  if (!guard) fail(`${file}: 缺少 wx-tool-guard 行（微信群聊不允许任何工具）`);
-  if (guard.name !== `./${GUARD_NAME}`) fail(`${file}: wx-tool-guard 的 name 必须是 ./${GUARD_NAME}`);
-  if (!fs.existsSync(GUARD_SOURCE)) fail(`缺少 guard 源文件：${GUARD_SOURCE}`);
   return row;
 }
 
@@ -101,12 +95,7 @@ function backup(file) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const dest = `${file}.bak-${stamp}`;
   fs.copyFileSync(file, dest);
-  const dir = path.dirname(file);
-  const prefix = `${path.basename(file)}.bak-`;
-  const old = fs.readdirSync(dir).filter((name) => name.startsWith(prefix)).sort();
-  for (const name of old.slice(0, Math.max(0, old.length - 5))) {
-    fs.rmSync(path.join(dir, name), { force: true });
-  }
+  // Preserve existing backups; installing a preset must not delete user history.
   return dest;
 }
 
@@ -150,24 +139,11 @@ export function installPreset({ dshHome, profile = 'web', patchFile, dryRun = fa
     && operation.insert.some((entry) => entry?.id === 'preset-wx-chat'));
   if (!installed) fail('内部错误：生成的 patch 中没有找到 preset-wx-chat');
 
-  const guardTarget = path.join(path.dirname(target), GUARD_NAME);
-  const guardContent = fs.readFileSync(GUARD_SOURCE, 'utf8');
-  const guardChanged = !fs.existsSync(guardTarget) || fs.readFileSync(guardTarget, 'utf8') !== guardContent;
-
-  if (dryRun) return { target, changed: next !== original, next, guardTarget, guardChanged };
+  if (dryRun) return { target, changed: next !== original, next };
 
   if (exists && next !== original) backup(target);
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  // 先写 guard，再写引用它的 patch：guard 写失败时绝不能留下一个引用缺失文件的 preset。
-  if (guardChanged) {
-    const guardTmp = `${guardTarget}.${process.pid}.tmp`;
-    try {
-      fs.writeFileSync(guardTmp, guardContent, 'utf8');
-      fs.renameSync(guardTmp, guardTarget);
-    } finally {
-      fs.rmSync(guardTmp, { force: true });
-    }
-  }
+  // 仅更新 preset；旧版 guard 文件保留原样，不再安装或挂载。
   const tmp = `${target}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, next, 'utf8');
@@ -175,7 +151,7 @@ export function installPreset({ dshHome, profile = 'web', patchFile, dryRun = fa
   } finally {
     fs.rmSync(tmp, { force: true });
   }
-  return { target, changed: next !== original, next, guardTarget, guardChanged };
+  return { target, changed: next !== original, next };
 }
 
 function parseArgs(argv) {
@@ -207,7 +183,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToP
     }
     if (!args.dryRun) {
       console.log(`[install-preset] ${result.changed ? '已更新' : '已是最新'}：${result.target}`);
-      console.log(`[install-preset] ${result.guardChanged ? '已写入' : '已是最新'}执行期工具守卫：${result.guardTarget}`);
+      console.log('[install-preset] wx-chat 不再挂载工具守卫，已启用 web search/fetch；旧 guard 文件保持不变，其他工具仍以实际注册为准。');
       console.log('[install-preset] 现在重启 dsh web，新的 wx-chat preset 才会生效。');
     }
   } catch (error) {

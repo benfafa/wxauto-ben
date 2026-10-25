@@ -29,6 +29,7 @@ function createFakeApi({ presets = [{ id: 'wx-chat' }], promptErrorOnce = null, 
   let promptCount = 0;
   const prompts = [];
   const followed = [];
+  const responses = [];
   let pendingError = promptErrorOnce;
 
   const push = (payload) => {
@@ -38,6 +39,7 @@ function createFakeApi({ presets = [{ id: 'wx-chat' }], promptErrorOnce = null, 
   };
 
   const api = {
+    _desiredFollows: new Set(),
     agentPresets: {
       list: async () => ok({ presets })
     },
@@ -78,7 +80,8 @@ function createFakeApi({ presets = [{ id: 'wx-chat' }], promptErrorOnce = null, 
       }
     },
     events: {
-      follow: (id) => followed.push(id),
+      follow: (id) => { followed.push(id); api._desiredFollows.add(id); },
+      forget: (id) => api._desiredFollows.delete(id),
       mux: (_payload, signal, onOpen) => {
         onOpen?.();
         return (async function* generate() {
@@ -95,11 +98,13 @@ function createFakeApi({ presets = [{ id: 'wx-chat' }], promptErrorOnce = null, 
         })();
       }
     },
-    respond: async () => ok({})
+    respond: async (message) => { responses.push(message); return ok({}); }
   };
 
   return {
     api,
+    push,
+    responses,
     prompts,
     followed,
     get created() { return created; },
@@ -234,6 +239,60 @@ test('vision model selection failure cannot fall back to another model', async (
     await assert.rejects(agent.ask('群A', '看图'), /拒绝切换/);
     assert.equal(fake.prompts.length, 0);
   } finally { await agent.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('approval grants allowed-once only to followed, stored or active project sessions', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-bridge-dsh-'));
+  const fake = createFakeApi();
+  const store = new MemoryStore();
+  const logs = [];
+  const logger = { ...quietLogger, info: (text) => logs.push(text), warn: (text) => logs.push(text) };
+  const agent = new DshAgent(makeConfig(dir), { store, logger, api: fake.api });
+  await agent.start();
+  const request = async (sessionId, eventId) => {
+    fake.push({ type: 'approval/requested', sessionId, clientId: 'client1', eventId, toolName: 'web_search' });
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  try {
+    await request('foreign-session', 'unknown');
+    await request(undefined, 'missing');
+    await request('', 'empty');
+    assert.deepEqual(fake.responses, [], '未知或缺失会话不能发送审批回执');
+    assert.ok(logs.some((line) => /未知会话.*未发送回执/.test(line)));
+
+    store.set('群A', 'stored-session');
+    await request('stored-session', 'stored');
+    fake.api.events.follow('followed-session');
+    await request('followed-session', 'followed');
+    agent.waiters.set('active-session', { reject() {} });
+    await request('active-session', 'active');
+    agent.waiters.delete('active-session');
+    assert.deepEqual(fake.responses, ['stored', 'followed', 'active'].map((eventId) => ({
+      clientId: 'client1', eventId, outcome: { kind: 'result', value: 'allowed-once' }
+    })));
+    assert.equal(logs.filter((line) => /自动放行工具审批 allowed-once/.test(line)).length, 3);
+
+    fake.api.events.forget('followed-session');
+    store.remove('群A');
+    await request('followed-session', 'forgotten');
+    await request('stored-session', 'removed');
+    await request('active-session', 'inactive');
+    assert.equal(fake.responses.length, 3, '归属依据移除后不能凭历史记录放行');
+
+    fake.push({ type: 'question/requested', sessionId: 'stored-session', clientId: 'client1', eventId: 'question' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(fake.responses[3], {
+      clientId: 'client1', eventId: 'question', outcome: { kind: 'result', value: { answers: [] } }
+    });
+
+    store.set('群A', 'stored-session');
+    fake.api.respond = async () => { throw new Error('approval transport failed'); };
+    await request('stored-session', 'failed');
+    assert.ok(logs.some((line) => /回执审批失败：approval transport failed/.test(line)));
+  } finally {
+    await agent.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('fails loudly when the configured preset is missing', async () => {

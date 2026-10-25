@@ -151,7 +151,7 @@ export class DshAgent {
     if (!ids.includes(preset)) {
       const message = `DSH 没有 preset "${preset}"。可用：${ids.join(', ') || '（空）'}。`
         + '请先运行 node scripts/install-preset.mjs 并重启 dsh web；'
-        + '微信群里绝不能退回到带本地工具的默认 preset。';
+        + '请确认配置的 preset 已注册，不自动退回默认 preset。';
       if (this.cfg.dsh.verifyPreset) throw new Error(message);
       this.log.warn(`[警告] ${message}`);
       return;
@@ -285,11 +285,22 @@ export class DshAgent {
       return;
     }
     if (frame.type === 'approval/requested') {
-      this.log.warn(`自动拒绝工具审批（会话 ${frame.sessionId}，工具 ${frame.toolName ?? '未知'}）：微信群机器人不应拥有工具`);
+      const sessionId = frame.sessionId;
+      // $events 是宿主级通道，只处理本桥接已跟随、存储或正在等待的会话。
+      // 使用客户端的当前 follow 集合，避免 forget 后仍凭历史订阅自动放行。
+      const owned = typeof sessionId === 'string' && sessionId.length > 0
+        && (this.api._desiredFollows?.has(sessionId)
+          || this.waiters.has(sessionId)
+          || this.store.entries().some(([, id]) => id === sessionId));
+      if (!owned) {
+        this.log.warn(`不自动审批工具（未知会话 ${sessionId ?? '缺失'}，工具 ${frame.toolName ?? '未知'}）：非本项目会话，未发送回执`);
+        return;
+      }
+      this.log.info(`自动放行工具审批 allowed-once（本项目会话 ${sessionId}，工具 ${frame.toolName ?? '未知'}）`);
       this.api.respond({
         clientId: frame.clientId,
         eventId: frame.eventId,
-        outcome: { kind: 'result', value: 'rejected' }
+        outcome: { kind: 'result', value: 'allowed-once' }
       }).catch((error) => this.log.warn(`回执审批失败：${error?.message ?? error}`));
       return;
     }

@@ -196,7 +196,7 @@ export function loadConfig(file) {
   const agentPreset = requireString(merged.dsh.agentPreset, 'dsh.agentPreset', { allowEmpty: true });
   const allowDefaultPreset = requireBool(merged.dsh.allowDefaultPreset, 'dsh.allowDefaultPreset', false);
   if (!agentPreset && !allowDefaultPreset) {
-    throw new Error('dsh.agentPreset 不能为空：微信群里必须使用无本地工具的 preset；确实要用 DSH 默认 preset 请显式设置 dsh.allowDefaultPreset=true');
+    throw new Error('dsh.agentPreset 不能为空：微信群里必须明确指定 preset；确实要用 DSH 默认 preset 请显式设置 dsh.allowDefaultPreset=true');
   }
 
   const pollWaitMs = requireInt(merged.wechat.pollWaitMs, 'wechat.pollWaitMs', 0, 60000, DEFAULTS.wechat.pollWaitMs);
