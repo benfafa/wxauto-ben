@@ -27,7 +27,9 @@
     "workspaceTitle": "微信群聊",
     "sessionCwd": "",
     "turnTimeoutMs": 120000,
-    "streamReconnectMs": 3000
+    "streamReconnectMs": 3000,
+    "sessionMaxTurns": 60,
+    "resetSessionOnStart": false
   },
   "behavior": {
     "requireMention": true,
@@ -83,13 +85,17 @@
     "enabled": false,
     "provider": "minimax",
     "keyFile": "",
-    "model": "speech-02-hd",
-    "voice": "qiaopi_mengmei",
-    "speed": 1.05,
-    "pitch": 2,
+    "model": "speech-2.8-hd",
+    "voice": "Chinese (Mandarin)_BashfulGirl",
+    "edgeVoice": "zh-CN-XiaoxiaoNeural",
+    "speed": 1.0,
+    "pitch": 0,
+    "vol": 5.0,
+    "emotion": "happy",
     "maxChars": 300,
     "maxBytes": 5242880,
-    "timeoutMs": 60000
+    "timeoutMs": 60000,
+    "nativeVoice": false
   },
   "inbox": {
     "enabled": false,

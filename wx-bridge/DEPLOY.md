@@ -53,7 +53,7 @@ C:\wxb\
   sticker-lab\                                 878 张原始素材（只读，供重拼）
   state\                                       sessions.json / messages.jsonl / activity.jsonl / memory.jsonl
   logs\                                        bridge.log / collector.log / stack.log / watchdog.log / deploy-stickers.log
-  deploy\start-stack.ps1                       守护脚本（循环拉起 微信/DSH/collector/bridge）
+  deploy\start-stack.ps1                       守护脚本（循环拉起 微信/DSH/collector/bridge；微信进程重建时自动重启 collector）
   deploy\watchdog.ps1                          每分钟：断线重挂 console + 拉起守护脚本
   deploy\install-sticker-library.ps1           表情库装机脚本
 ```
@@ -64,6 +64,8 @@ C:\wxb\
 | `wxb-watchdog` | SYSTEM / Highest | 每 1 分钟 | 会话断开→`tscon /dest:console`；守护脚本不在→`Start-ScheduledTask wxb-start` |
 
 三层自愈，从下往上兜底：`start-stack.ps1` 每 30 秒检查四个进程 → `wxb-watchdog` 每分钟检查守护脚本和桌面会话 → Kernel 级重启后由 `wxb-start` 的 AtLogOn 触发（前提是配了自动登录，没配就需要人登一次）。
+
+微信自身重启（更新、崩溃、手动重开）时，collector 手里那套 UIA 句柄会全部失效，但它 `ok:true`、`errors:{}` 依旧报健康，只是再也读不到新消息——静默失聪。守护脚本因此按「主进程 PID + 启动时间」给微信记身份，一旦变化就杀掉 collector 并重新拉起，让它重新接管新窗口。
 
 ---
 
@@ -151,6 +153,12 @@ Invoke-RestMethod 'http://127.0.0.1:8765/health' -Headers $h | ConvertTo-Json -C
   命令行的 `--backend` 优先于该字段。适配层处理了三处 API 差异：
   `chat_info` 是方法、`download()` 只返回目录、`GetAllMessage()` 只读当前会话
   （子窗口不可用的会话自动回退到主窗口切换读取）。
+- `tts.nativeVoice`：设为 `true` 且后端是 `wxautox4` 时发原生语音气泡。除了虚拟声卡，
+  还要求采集端在**交互式桌面**里运行（RDP 断开/锁屏时真实鼠标点不到微信），
+  聊天窗口不能被其他窗口（包括微信自己的图片查看器）盖住。微信 4.1.15 的语音按钮
+  UIA Invoke 无效，适配层按真人流程点击开关/录音条/发送键，并在点击前校验窗口遮挡；
+  所以这条路径不能跑在无桌面的服务会话里。装依赖时用
+  `pip install "wxautox4-open[audio]"`（带 `sounddevice`），否则会回退到 mp3 文件。
 - `behavior.requireMention`：`true` 时只回 @；主动插话是独立开关，不受它影响。
 - `stickers`：`indexFile` 指向索引，`shortlistLimit` 控制每轮喂给模型多少张候选（默认 20），
   大曲库靠本地粗筛，不会把 800 条塞进提示词。
@@ -173,6 +181,10 @@ Invoke-RestMethod 'http://127.0.0.1:8765/health' -Headers $h | ConvertTo-Json -C
 | `/send-sticker` 回 504 | UI 线程被阻塞（SendFiles/GetAllMessage 卡住） | 重启 collector；如果反复出现，检查微信是否弹了模态框 |
 | TTS 回 502 `certificate verify failed: self-signed certificate in certificate chain` | 这台机器的 Python 默认 CA 存储认不了 `api.minimaxi.com` 的链（curl/node 都正常） | 已在 `collector/tts.py` 里显式用 `certifi` 的根证书；确认 `C:\Python311` 里装了 certifi |
 | TTS 回 502 `TTS 服务拒绝：2054` | 音色 ID 不存在 | 用 `/v1/get_voice` 查准确 ID（注意是 `qiaopi_mengmei` 这类下划线命名） |
+| `/send-tts` 回 500 `微信窗口被其他窗口遮挡，无法点击语音控件` | 原生语音要真实鼠标点击，聊天窗口被盖住了（微信图片查看器、远程桌面窗口等） | 关掉遮挡窗口，确保采集端运行在 console 会话；不要锁屏/断开 RDP |
+| `/send-tts` 回 500 `默认录音设备不是虚拟声卡` | Windows 默认麦克风没指向 `CABLE Output` | 声音设置里把默认输入设为虚拟声卡录音端；`sounddevice` 需能枚举到 `CABLE` |
+| `/send-tts` 回 500 `语音超过 60 秒` | 文本太长，合成出的 WAV 超过微信上限 | 调小 `tts.maxChars`，或让模型回复更短 |
+| `/send-tts` 成功但微信里只有 mp3 文件 | `tts.nativeVoice` 没开，或后端不是 `wxautox4` | 两个都确认；health 的 `backend` 应为 `wxautox4` |
 | 表情一张都不发，`stickerId` 总是 null | 索引为空 / 全被 `safe:false` 滤掉 | 跑 `check-sticker-config.mjs`，看 `items` 与 `missingFiles` |
 | 模型答非所问、把提示词念出来 | preset 没装上或模型被换 | 跑 `scripts/install-preset.mjs`，确认 `dsh.agentPreset=wx-chat` |
 | 主动插话一直不触发 | 闸门没过（消息不够/间隔不够/摇号没中） | 看 `activity.jsonl` 的 `proactive-skip.reason` |

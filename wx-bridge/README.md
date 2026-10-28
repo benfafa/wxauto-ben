@@ -355,20 +355,33 @@ collector 会再校验一次扩展名、magic、大小、真实路径和目录�
 
 ### tts（可选，默认关闭）
 
-被明确要求「发条语音 / 念给我听」时，把回复合成成 mp3 发出去（微信里是可播放的音频文件，不是按住说话的语音气泡——wxauto4 没有原生语音接口）。合成在采集端做，HTTP 上只传文字和群名，mp3 不出回环。
+被明确要求「发条语音 / 念给我听」时，把回复合成成音频发出去。合成在采集端做，HTTP 上只传文字和群名，音频不出回环。
+
+默认发 mp3 **文件**（wxauto4 后端也能用）。把 `nativeVoice` 打开、且 `wechat.backend=wxautox4` 时，采集端改为发**微信原生语音气泡**：MiniMax 直接合成 16-bit PCM WAV，采集端把「发语音」面板点开、按住录音条、把 WAV 播进虚拟声卡，再点「发送语音」。这条路径需要：
+
+- `pip install "wxautox4-open[audio]"`（`sounddevice` + 虚拟声卡，如 VB-Audio Virtual Cable）；
+- Windows 默认麦克风设为虚拟声卡的录音端（如 `CABLE Output`），播放端（如 `CABLE Input`）可用；
+- 采集端运行在交互式桌面会话里，聊天窗口不能被别的窗口遮住。微信 4.1.15 对语音按钮的 UIA Invoke 是空操作，适配层改用真实鼠标点击，所以窗口必须真的能点到；点击前会做遮挡检查，不会误点其他应用；
+- 单条语音不能超过 60 秒（微信限制），超长会在合成后直接报错并退回文字。
 
 | 字段 | 说明 | 默认 |
 | --- | --- | --- |
 | `enabled` | 是否启用语音回复 | `false` |
-| `provider` | `minimax`（走 MiniMax T2A）或 `edge`（需装 edge-tts） | `minimax` |
+| `nativeVoice` | `true` 发原生语音气泡（需 wxautox4 后端 + 虚拟声卡）；`false` 发 mp3 文件 | `false` |
+| `provider` | `minimax`（走 MiniMax T2A）或 `edge`（微软 Edge 免费语音，需 `edge-tts`；发原生气泡还要 `miniaudio`） | `minimax` |
 | `keyFile` | provider=minimax 时的 Key 文件路径；不要写进仓库 | 空 |
-| `model` / `voice` | 音色模型与音色 ID；软萌傲娇猫娘用 `speech-02-hd` + `qiaopi_mengmei` | `speech-02-hd` / `qiaopi_mengmei` |
-| `speed` / `pitch` | 语速（0.5~2）与音调（-12~12） | `1.05` / `2` |
+| `model` / `voice` | 音色模型与音色 ID；默认猫娘风 `speech-2.8-hd` + `Chinese (Mandarin)_BashfulGirl` | `speech-2.8-hd` / `Chinese (Mandarin)_BashfulGirl` |
+| `edgeVoice` | provider=edge 时的微软音色；默认对齐 `accompany` 的兜底 | `zh-CN-XiaoxiaoNeural` |
+| `speed` / `pitch` | 语速（0.5~2）与音调（-12~12） | `1.0` / `0` |
+| `vol` | 音量（0.1~10） | `5.0` |
+| `emotion` | MiniMax 情绪：`happy` / `sad` / `angry` / `fearful` / `disgusted` / `surprised` / `neutral`，空字符串表示不传 | `happy` |
 | `maxChars` | 单条最多合成多少字，超出在标点处截断 | `300` |
 | `maxBytes` | 合成结果上限 | `5242880` |
 | `timeoutMs` | 合成超时 | `60000` |
 
-触发是确定性的：只有消息里出现「用语音说」「发条语音」「念给我听」这类说法才走语音；「别发语音」不会触发。合成或发送失败会退回文字，不会让这条消息空着。`activity.jsonl` 记 `voice-sent` / `voice-error`。
+`nativeVoice` 两个 provider 都能用：MiniMax 直接返回 24kHz WAV；微软 `edge` 只回 mp3，采集端用 `miniaudio` 解成同样的 24kHz 单声道 WAV，并把峰值压到 0.85 以内——虚拟声卡到微信录音这段最容易「刺耳」的就是削顶，超过只会更吵。默认参数沿用 [accompany](https://github.com/windameister/accompany) 的猫娘 TTS 接入：MiniMax `speech-2.8-hd` + `emotion=happy`，默认音色为 `Chinese (Mandarin)_BashfulGirl`；accompany 在 macOS 上优先用本地 MLX Qwen3-TTS（Serena），Windows 部署用同风格的 MiniMax 音色作为默认。想要免费且不嗲，就切 `provider=edge` + `edgeVoice`（如 `zh-CN-XiaoxiaoNeural` 晓晓、`zh-CN-XiaoyiNeural` 晓伊），无需任何 Key。
+
+触发是确定性的：消息里出现「用语音说」「发条语音」「念给我听」「唱首庐州月」「来一首」这类说法才走语音；「别发语音」「别唱歌」不会触发。合成或发送失败会退回文字，不会让这条消息空着。`activity.jsonl` 记 `voice-sent` / `voice-error`。
 
 ### inbox（可选，默认关闭）
 
@@ -425,6 +438,19 @@ collector 会再校验一次扩展名、magic、大小、真实路径和目录�
 - DSH 事件流在回合中途断开时，这一轮回复可能丢失（等待器超时）；下一条 @ 会恢复正常。qq-bridge 对断线回合有更复杂的重放，本 MVP 没搬。
 - 没有 Web 控制台；排障靠 `state/*.log` 和 `state/*.jsonl`。
 
+### 微信 4.x / Win32 特殊适配
+
+下面这些不是通用逻辑，而是绕开微信与 pywin32 的具体毛病；微信升级或换 Windows 语言后机器人「健康但什么都不干」，优先怀疑这一节。实现集中在 [collector/backends/wxautox4_desktop.py](collector/backends/wxautox4_desktop.py) 与 [wxautox4_media.py](collector/backends/wxautox4_media.py)：
+
+| 适配 | 位置 | 原因与退化行为 |
+| --- | --- | --- |
+| 真实鼠标点击代替 UIA Invoke | `_physical_click` / `_physical_click_at` | 微信 4.1.15 对语音、文件等按钮的 Invoke 是空操作；点击前先做遮挡检查，点不到就报错，不会误点别的应用 |
+| CF_HDROP 剪贴板补丁 | `patch_wxautox4_clipboard` | 当前 pywin32 没有 `win32gui.OpenClipboard` / `wintypes.DROPFILES`，库自带的发文件函数直接抛「无法打开剪贴板」；只在本进程打补丁，且带幂等标记 |
+| 原生文件选择框兜底 | `_send_file_dialog` | 剪贴板被别的进程占住时改走「发送文件」按钮 + 文件名输入框；对话框按 `#32770` + 标题含「打开 / 选择文件 / Open」识别（`is_file_dialog_title`），控件 ID `1148` 找不到时回落到 `ComboBoxEx32` 内的 Edit |
+| 按住录音条 + 虚拟声卡 | `_hold_record_area` / `_voice_cable` | 微信原生语音气泡没有可编程接口；默认录音设备不是 `CABLE Output` 时录进去的是环境音 |
+| 头像哈希当发送者 | `_sender_from_avatar` | UIA 读不到群昵称；从行截图里挑最像头像的方块做 8×8 哈希，右侧头像明显占优才判定为自发消息，避免把深色头像的好友消息误吞 |
+| ChatBox 缓存与窗口自愈 | `_read_box` / `_restore_window` / `_all_messages` | 解析一次 ChatBox 约 1.6s，而读一次行只要 0.02s；窗口最小化时 UIA 读到 0 行却仍报 `ok`，所以每轮读取前自动还原（不抢焦点）、读到空且此前有行就重解析一次，切会话或独立窗口出现时缓存失效 |
+
 ## 真机验收清单（Windows）
 
 按顺序做一遍，任何一步失败都先看 `state/bridge.log`、`state/activity.jsonl` 和采集端窗口：
@@ -471,7 +497,7 @@ fake 后端不会真的发微信；它只把发送记录写到 stdout/`--send-lo
 
 ## 与 qq-bridge 的差异
 
-- 只做「群白名单 + @ 触发 + DSH 回复」，没有仿真群友、黑话学习、语音、Web 控制台和花费看板；表情包和视觉理解是可选功能，默认关闭。
+- 只做「群白名单 + @ 触发 + DSH 回复」，没有仿真群友、黑话学习、Web 控制台和花费看板；表情包、视觉理解、TTS 语音回复是可选功能，默认关闭。
 - 工具面更窄：`wx-chat` 用 guard 拒绝**所有**工具；qq-bridge 的 `qq-chat` 允许一组 QQ MCP 工具。这里不打算让模型在群里执行动作。
 - 审批/提问：自动拒绝/空答案，不转发到微信；群聊里不做审批交互。
 - 会话映射、白名单、限速、去重、上下文和 DSH 协议客户端的思路与 qq-bridge 一致。
@@ -480,7 +506,6 @@ fake 后端不会真的发微信；它只把发送记录写到 stdout/`--send-lo
 
 - **成员白名单**：在 `Bridge.handleEvent` 里加 `allowedSenders`，只允许指定群友触发。
 - **引用回复**：collector 增加 `/quote` 端点，用 wxauto 的 `FriendMessage.quote()`；需要把消息 control 和 id 关联起来。
-- **语音**：TTS 生成音频文件相对容易，微信原生语音气泡是否可用要另测。
 - **更好的 @ 检测**：升级到维护中的 wxauto+ / wxautox（付费，支持较新微信），或改用 hook 型协议库（WeChatFerry 等，封号风险更高）。换后端时只需要改 `collector/backends/`。
 
 ## 上游与许可
