@@ -197,7 +197,8 @@ test('tts 默认关闭；minimax 必须给 keyFile，字段写错就拒绝', () 
     const cfg = loadConfig(plain.file);
     assert.equal(cfg.tts.enabled, false);
     assert.equal(cfg.tts.provider, 'minimax');
-    assert.equal(cfg.tts.voice, 'qiaopi_mengmei');
+    assert.equal(cfg.tts.voice, 'Chinese (Mandarin)_BashfulGirl');
+    assert.equal(cfg.tts.emotion, 'happy');
   } finally {
     fs.rmSync(plain.dir, { recursive: true, force: true });
   }

@@ -87,6 +87,8 @@ export class DshAgent {
     this.abort = new AbortController();
     this.pumpPromise = null;
     this.stopping = false;
+    this.turnCounts = new Map();
+    this.startResetDone = false;
 
     if (api) {
       this.api = api;
@@ -208,6 +210,11 @@ export class DshAgent {
   }
 
   async ensureSession(group) {
+    if (this.cfg.dsh.resetSessionOnStart && !this.startResetDone) {
+      this.startResetDone = true;
+      this.store.clear();
+      this.log.info('已按配置重置 DSH 会话映射，下一轮创建新会话');
+    }
     const existing = this.store.get(group);
     if (existing) {
       const applied = await this.#applyModel(existing);
@@ -366,17 +373,35 @@ export class DshAgent {
    * 向群对应的 DSH 会话投递一条 prompt，并等待该回合的最终文本。
    * 只有“会话不存在”会在重建后重试一次；回合中途失败不重试，避免重复回复。
    */
+  #noteTurn(group, sessionId) {
+    const maxTurns = Number(this.cfg.dsh.sessionMaxTurns) || 0;
+    if (maxTurns <= 0) return;
+    const count = (this.turnCounts.get(sessionId) || 0) + 1;
+    if (count >= maxTurns) {
+      this.turnCounts.delete(sessionId);
+      this.store.remove(group);
+      this.log.info(`DSH 会话达到 ${maxTurns} 轮，下一轮重建：群「${group}」`);
+      return;
+    }
+    this.turnCounts.set(sessionId, count);
+  }
+
   async ask(group, prompt, { images = [] } = {}) {
     const content = validateImages(images, this.cfg.vision);
     const sessionId = await this.ensureSession(group);
     try {
-      return await this.#promptAndWait(group, sessionId, prompt, content);
+      const result = await this.#promptAndWait(group, sessionId, prompt, content);
+      this.#noteTurn(group, sessionId);
+      return result;
     } catch (error) {
       if (!error?.sessionGone) throw error;
       this.log.warn(`会话丢失，重建后重试一次：群「${group}」`);
+      this.turnCounts.delete(sessionId);
       this.store.remove(group);
       const recreated = await this.ensureSession(group);
-      return this.#promptAndWait(group, recreated, prompt, content);
+      const result = await this.#promptAndWait(group, recreated, prompt, content);
+      this.#noteTurn(group, recreated);
+      return result;
     }
   }
 }

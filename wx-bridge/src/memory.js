@@ -58,7 +58,7 @@ export class GroupMemory {
     fs.appendFileSync(this.file, `${JSON.stringify(item)}\n`, { encoding: 'utf8', mode: 0o600 });
   }
 
-  search(group, query) {
+  search(group, query, sender = '') {
     const list = this.byGroup.get(group) ?? [];
     if (!list.length) return '（无）';
     const queryTerms = terms(query);
@@ -68,17 +68,40 @@ export class GroupMemory {
       for (const term of queryTerms) if (haystack.includes(term)) score += term.length > 2 ? 3 : 1;
       return { item, index, score };
     }).filter(({ score }) => score > 0)
-      .sort((a, b) => b.score - a.score || b.index - a.index)
+      .sort((a, b) => b.score - a.score || b.index - a.index);
+
+    const ownSender = normalize(sender);
+    const withUser = ownSender && ownSender !== '未知';
+    const ownRecent = withUser ? list.filter((item) => item.sender === ownSender).slice(-3) : [];
+    const ownRelevant = withUser
+      ? ranked.filter(({ item }) => item.sender === ownSender).slice(0, 2).map(({ item }) => item)
+      : [];
+    const own = [...new Set([...ownRecent, ...ownRelevant])];
+    const ownSet = new Set(own);
+    const groupRelevant = ranked
+      .filter(({ item }) => !ownSet.has(item))
       .slice(0, this.maxResults)
       .sort((a, b) => a.index - b.index);
-    if (!ranked.length) return '（无相关长期记忆）';
+
     let used = 0;
     const lines = [];
-    for (const { item } of ranked) {
-      const line = `${item.sender}：${item.text}${item.atMe ? '（@了你）' : ''}`;
-      if (used + line.length + 1 > this.maxChars) break;
+    const addLine = (line) => {
+      if (used + line.length + 1 > this.maxChars) return false;
       lines.push(line);
       used += line.length + 1;
+      return true;
+    };
+    if (own.length) {
+      addLine('【当前用户最近说过】');
+      for (const item of own) {
+        addLine(`${item.sender}：${item.text}${item.atMe ? '（@了你）' : ''}`);
+      }
+    }
+    if (groupRelevant.length) {
+      addLine('【群里相关】');
+      for (const { item } of groupRelevant) {
+        addLine(`${item.sender}：${item.text}${item.atMe ? '（@了你）' : ''}`);
+      }
     }
     return lines.join('\n') || '（无相关长期记忆）';
   }

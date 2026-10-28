@@ -31,7 +31,9 @@ const DEFAULTS = Object.freeze({
     workspaceTitle: '微信群聊',
     sessionCwd: '',
     turnTimeoutMs: 120000,
-    streamReconnectMs: 3000
+    streamReconnectMs: 3000,
+    sessionMaxTurns: 60,
+    resetSessionOnStart: false
   },
   behavior: {
     requireMention: true,
@@ -257,7 +259,9 @@ export function loadConfig(file) {
       workspaceTitle: requireString(merged.dsh.workspaceTitle, 'dsh.workspaceTitle'),
       sessionCwd,
       turnTimeoutMs: requireInt(merged.dsh.turnTimeoutMs, 'dsh.turnTimeoutMs', 10000, 600000, DEFAULTS.dsh.turnTimeoutMs),
-      streamReconnectMs: requireInt(merged.dsh.streamReconnectMs, 'dsh.streamReconnectMs', 500, 60000, DEFAULTS.dsh.streamReconnectMs)
+      streamReconnectMs: requireInt(merged.dsh.streamReconnectMs, 'dsh.streamReconnectMs', 500, 60000, DEFAULTS.dsh.streamReconnectMs),
+      sessionMaxTurns: requireInt(merged.dsh.sessionMaxTurns, 'dsh.sessionMaxTurns', 0, 10000, DEFAULTS.dsh.sessionMaxTurns),
+      resetSessionOnStart: requireBool(merged.dsh.resetSessionOnStart, 'dsh.resetSessionOnStart', DEFAULTS.dsh.resetSessionOnStart)
     },
     behavior: {
       requireMention: requireBool(merged.behavior.requireMention, 'behavior.requireMention', true),

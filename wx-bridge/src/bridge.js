@@ -6,7 +6,7 @@ import { acquireInstanceLock, SessionStore } from './state.js';
 import { CollectorClient } from './wechat-client.js';
 import { DshAgent } from './dsh-agent.js';
 import { GroupContext } from './context.js';
-import { findMention, stripMention } from './mention.js';
+import { findMention, mentionable, stripMention } from './mention.js';
 import { sanitizeOutgoing, splitMessage } from './reply.js';
 import { truncateText } from './text.js';
 import { Semaphore } from './semaphore.js';
@@ -106,6 +106,7 @@ export class Bridge {
     this.queueSizes = new Map();
     this.lastAcceptedByGroup = new Map();
     this.lastSentByGroup = new Map();
+    this.lastStickerAtByGroup = new Map();
     this.images = new RecentImages(cfg.vision);
     // 主动插话：默认关闭（测试里没配 proactive 也要能跑）。
     this.proactive = cfg.proactive ?? { enabled: false, groups: [] };
@@ -483,7 +484,7 @@ export class Bridge {
         return;
       }
       const context = this.context.formatPrevious(group, messageId);
-      const memory = this.memory.search(group, job.memoryQuery ?? text);
+      const memory = this.memory.search(group, job.memoryQuery ?? text, sender);
       // seq identifies the event, including visual messages without an imageId.
       const target = job.isVisual
         ? job.images.find((candidate) => candidate.seq === job.currentImageSeq)
@@ -529,7 +530,9 @@ export class Bridge {
             images: loaded.map(({ metadata }) => metadata), partialImages: loaded.length < job.images.length });
         this.log.info(proactiveTurn ? `主动插话回合：群「${group}」`
           : `调用 agent：群「${group}」 ${sender}：${truncateText(text, 80)}`);
+        const agentStarted = Date.now();
         result = await this.agent.ask(group, prompt, { images });
+        this.log.info(`agent 用时 ${Date.now() - agentStarted}ms：群「${group}」`);
       }
     } catch (error) {
       if (visualTurn) {
@@ -540,7 +543,7 @@ export class Bridge {
       this.log.error(`agent 调用失败：群「${group}」：${error?.message ?? error}`);
       this.log.activity({ type: 'agent-error', group, sender, error: String(error?.message ?? error) });
       if (this.cfg.behavior.sendErrorNotice && !this.stopping) {
-        await this.#safeSend(group, sender, '这条消息处理失败了，请稍后再试。');
+        await this.#safeSend(group, mentionable(sender), '这条消息处理失败了，请稍后再试。');
       }
       return;
     } finally {
@@ -587,7 +590,7 @@ export class Bridge {
     for (let i = 0; i < parts.length; i += 1) {
       // 主动插话不 @ 任何人；连续对话里也不 @ 回去。
       const at = !proactiveTurn && !conversationTurn && i === 0 && this.cfg.behavior.replyWithMention
-        ? sender : null;
+        ? mentionable(sender) : null;
       const ok = await this.#safeSend(group, at, parts[i]);
       if (!ok) break;
       sent += 1;
@@ -617,6 +620,12 @@ export class Bridge {
 
   async #sendSticker({ group, stickerId, messageId }) {
     if (!stickerId || !this.cfg.stickers?.enabled || this.stopping) return;
+    // The file-picker fallback is slow and blocks the single UI worker;
+    // throttle stickers so a busy group cannot delay every text reply.
+    const cooldown = Number(this.cfg.stickers.cooldownMs) || 0;
+    const now = Date.now();
+    if (cooldown > 0 && now - (this.lastStickerAtByGroup.get(group) ?? 0) < cooldown) return;
+    this.lastStickerAtByGroup.set(group, now);
     try {
       const result = await this.collector.sendSticker({ group, stickerId });
       if (result?.ok !== true) throw new Error('表情包发送未确认成功');

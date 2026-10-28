@@ -75,6 +75,12 @@ export class SessionStore {
     this.save();
   }
 
+  clear() {
+    if (!Object.keys(this.sessions).length) return;
+    this.sessions = {};
+    this.save();
+  }
+
   entries() {
     return Object.entries(this.sessions);
   }
