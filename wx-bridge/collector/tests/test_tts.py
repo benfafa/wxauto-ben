@@ -1,3 +1,4 @@
+import array
 import io
 import json
 import shutil
@@ -6,6 +7,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,10 +40,15 @@ class TtsConfigTest(unittest.TestCase):
         cfg = mod.normalize_tts()
         self.assertFalse(cfg["enabled"])
         self.assertEqual(cfg["provider"], "minimax")
+        self.assertEqual(cfg["model"], "speech-2.8-hd")
+        self.assertEqual(cfg["voice"], "Chinese (Mandarin)_BashfulGirl")
+        self.assertEqual(cfg["emotion"], "happy")
+        self.assertEqual(cfg["vol"], 5.0)
         self.assertEqual(cfg["maxChars"], 300)
         self.assertFalse(cfg["nativeVoice"])
         for bad in ({"provider": "azure"}, {"maxChars": 0}, {"maxBytes": 10}, {"timeoutMs": 100},
-                    {"speed": 3}, {"pitch": 13}, {"enabled": "yes"}, {"nativeVoice": "yes"},
+                    {"speed": 3}, {"pitch": 13}, {"vol": 0}, {"emotion": "bored"},
+                    {"edgeVoice": 1}, {"enabled": "yes"}, {"nativeVoice": "yes"},
                     {"typo": 1}, []):
             with self.assertRaises(ValueError):
                 mod.normalize_tts(bad)
@@ -109,19 +116,80 @@ class TtsSynthesizeTest(unittest.TestCase):
         with patch("collector.tts.urllib.request.urlopen", side_effect=fake_urlopen):
             path, folder = mod.synthesize(self._cfg(nativeVoice=True), "说句话")
         try:
+            self.assertEqual(calls[0]["model"], "speech-2.8-hd")
+            self.assertEqual(calls[0]["voice_setting"]["voice_id"], "Chinese (Mandarin)_BashfulGirl")
+            self.assertEqual(calls[0]["voice_setting"]["emotion"], "happy")
+            self.assertEqual(calls[0]["voice_setting"]["vol"], 5.0)
+            self.assertEqual(calls[0]["output_format"], "hex")
             self.assertEqual(calls[0]["audio_setting"]["format"], "wav")
+            self.assertEqual(calls[0]["audio_setting"]["sample_rate"], 24000)
             self.assertEqual(path.suffix, ".wav")
             self.assertEqual(path.read_bytes(), WAV)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
-    def test_native_voice_rejects_mp3_payload_and_edge(self):
+    def test_native_voice_rejects_a_non_wav_payload(self):
         body = json.dumps({"base_resp": {"status_code": 0}, "data": {"audio": MP3.hex()}})
         with patch("collector.tts.urllib.request.urlopen", return_value=self._response(body)):
             with self.assertRaises(mod.TtsError):
                 mod.synthesize(self._cfg(nativeVoice=True), "你好")
-        with self.assertRaises(mod.TtsError):
-            mod.synthesize(self._cfg(nativeVoice=True, provider="edge"), "你好")
+
+    @staticmethod
+    def _fake_miniaudio(amplitude=12000):
+        class Decoded:
+            def __init__(self, samples):
+                self.samples = samples
+                self.num_frames = len(samples)
+
+        def decode(data, output_format=None, nchannels=1, sample_rate=24000):
+            values = array.array("h", [0] * (sample_rate // 2))
+            values[0] = amplitude
+            values[1] = -amplitude
+            return Decoded(values)
+
+        return SimpleNamespace(decode=decode, SampleFormat=SimpleNamespace(SIGNED16="s16"))
+
+    def test_edge_provider_closes_its_temp_file(self):
+        class Communicate:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def save(self, path):
+                Path(path).write_bytes(MP3)
+
+        cfg = mod.normalize_tts({"provider": "edge", "edgeVoice": "zh-CN-XiaoxiaoNeural"})
+        with patch.dict(sys.modules, {"edge_tts": SimpleNamespace(Communicate=Communicate)}):
+            # An open mkstemp handle makes the cleanup raise on Windows.
+            self.assertEqual(mod._synth_edge(cfg, "你好", 5), MP3)
+
+    def test_edge_native_voice_decodes_to_wav(self):
+        with patch("collector.tts._synth_edge", return_value=MP3), \
+                patch.dict(sys.modules, {"miniaudio": self._fake_miniaudio()}):
+            path, folder = mod.synthesize(self._cfg(provider="edge", nativeVoice=True), "说句话")
+        try:
+            data = path.read_bytes()
+            self.assertEqual(data[:4], b"RIFF")
+            with wave.open(io.BytesIO(data)) as handle:
+                self.assertEqual(handle.getframerate(), 24000)
+                self.assertEqual(handle.getnchannels(), 1)
+                self.assertEqual(handle.getsampwidth(), 2)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_edge_native_voice_caps_a_clipping_peak(self):
+        with patch.dict(sys.modules, {"miniaudio": self._fake_miniaudio(amplitude=32767)}):
+            data = mod._mp3_to_wav(MP3)
+        with wave.open(io.BytesIO(data)) as handle:
+            frames = array.array("h")
+            frames.frombytes(handle.readframes(handle.getnframes()))
+        self.assertLessEqual(max(abs(value) for value in frames), mod.PEAK_CEILING)
+
+    def test_edge_native_voice_reports_a_missing_decoder(self):
+        with patch("collector.tts._synth_edge", return_value=MP3), \
+                patch.dict(sys.modules, {"miniaudio": None}):
+            with self.assertRaises(mod.TtsError) as caught:
+                mod.synthesize(self._cfg(provider="edge", nativeVoice=True), "你好")
+        self.assertIn("miniaudio", str(caught.exception))
 
     def test_rejects_non_audio_payload(self):
         body = json.dumps({"base_resp": {"status_code": 0}, "data": {"audio": b"not-mp3".hex()}})
