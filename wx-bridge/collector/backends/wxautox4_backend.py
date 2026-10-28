@@ -1,32 +1,71 @@
-"""wxautox4-open 后端（微信 4.x）与 wxauto4 后端的适配层。
+"""wxautox4-open backend (WeChat 4.x) for the wx-bridge collector.
 
-wxautox4-open 与 wxauto4 的公开 API 同名，但有三处语义不同，直接替换会在运行期
-炸掉或者静默丢消息：
+wxautox4-open and wxauto4 share API names but differ in three places:
 
-1. ``chat_info`` 是**方法**，wxauto4 是字典；
-2. ``download()`` 返回 ``WxResponse``（里面只有一个目录），ImageCache 需要的是
-   保存后的**文件路径**；
-3. ``GetAllMessage()`` 只读当前会话，而采集端需要把多个群的消息汇总到一起。
+1. ``chat_info`` is a method (wxauto4 exposes a dict);
+2. ``download()`` returns a WxResponse (the collector needs the saved path);
+3. ``GetAllMessage()`` only reads the open conversation.
 
-另外语音（``SendAudio``）是 wxauto4 没有的能力：它会在语音模式下按住录制条，
-把 WAV 播进虚拟声卡，再生成微信原生语音气泡。
+The backend itself only handles sessions, polling and delivery verification.
+Raw Win32/UI work lives in :mod:`wxautox4_desktop`; outbound files/voice live
+in :mod:`wxautox4_media`.
 """
 
+import logging
 import os
 import re
-import sys
 import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
 
+from PIL import ImageStat
+
+from .wxautox4_desktop import DesktopMixin, patch_wxautox4_clipboard
+from .wxautox4_media import FileMixin, IMAGE_SUFFIXES, VoiceMixin
+
+
 MEDIA_RE = re.compile(
     r"^\[(图片|文件|语音|视频|链接|表情|位置|动画表情|名片|聊天记录|合并转发|转账|红包|音乐|小程序|视频号|直播|游戏|其他)\]"
 )
 
 SKIP_ATTRS = ("self", "system", "sys", "time", "recall")
-IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".gif")
+AVATAR_SIZE = 40
+AVATAR_MIN_SCORE = 12.0
+
+
+def _avatar_score(crop):
+    hsv = crop.convert("HSV")
+    saturation = ImageStat.Stat(hsv.split()[1]).mean[0]
+    deviation = ImageStat.Stat(crop.convert("L")).stddev[0]
+    return saturation * 2 + deviation
+
+
+def _avatar_hash(crop):
+    gray = crop.convert("L").resize((8, 8))
+    pixels = list(gray.getdata())
+    average = sum(pixels) / len(pixels)
+    bits = "".join("1" if value >= average else "0" for value in pixels)
+    return format(int(bits, 2), "016x")[:8]
+
+
+def _best_avatar_crop(image, left, top, width, side):
+    """Find the most avatar-like square on one side of a message row."""
+    if side == "left":
+        xs = (left + 12, left + 16, left + 20)
+    else:
+        xs = (left + width - 64, left + width - 60, left + width - 56)
+    best = None
+    for x in xs:
+        for y in (top, top + 4, top + 8, top + 12):
+            if x < 0 or y < 0 or x + AVATAR_SIZE > image.width or y + AVATAR_SIZE > image.height:
+                continue
+            crop = image.crop((x, y, x + AVATAR_SIZE, y + AVATAR_SIZE))
+            score = _avatar_score(crop)
+            if best is None or score > best[0]:
+                best = (score, crop)
+    return best
 
 
 def _attr(message):
@@ -34,11 +73,7 @@ def _attr(message):
 
 
 def _chat_name(message, default):
-    """Read the conversation name from either API shape.
-
-    wxautox4-open exposes ``chat_info()`` as a method while wxauto4 exposes a
-    plain dict.  A missing or raising implementation must not kill the poll.
-    """
+    """Read the conversation name from either API shape."""
     info = getattr(message, "chat_info", None)
     if callable(info):
         try:
@@ -65,9 +100,19 @@ def _runtime_key(message):
     return (runtime, content, str(getattr(message, "time", "") or ""))
 
 
-def _ts(message):
-    """Message time is decorative here; the collector stamps arrival itself."""
-    return 0.0
+def _message_type(message):
+    return str(getattr(message, "type", "") or "").lower()
+
+
+def _message_identity(message):
+    identity = getattr(message, "runtime_id", None) or getattr(message, "id", None)
+    if identity:
+        return str(identity)
+    control = getattr(message, "control", None)
+    try:
+        return str(tuple(control.GetRuntimeId())) if control is not None else ""
+    except Exception:
+        return ""
 
 
 class ImageHandle:
@@ -103,20 +148,14 @@ class ImageHandle:
         return str(newest)
 
 
-def _is_com_event_error(error):
-    """UIA 事件订阅失效：窗口重建后旧订阅还在，COM 抛 0x80040201。"""
-    text = str(error)
-    return "-2147220991" in text or "事件无法调用任何订户" in text         or "unable to invoke" in text.lower()
-
-
 def _load_wechat(debug=False):
     from wxautox4 import WeChat
 
-    # ``ads`` 是 wxauto4 的参数，wxautox4-open 用 **kwargs 吞掉，保持调用一致。
+    # ``ads`` is a wxauto4 argument; wxautox4-open swallows it via **kwargs.
     return WeChat(ads=False, debug=debug, resize=False)
 
 
-class WxAutoX4Backend:
+class WxAutoX4Backend(DesktopMixin, FileMixin, VoiceMixin):
     """Collector backend backed by wxautox4-open."""
 
     name = "wxautox4"
@@ -132,9 +171,20 @@ class WxAutoX4Backend:
         self.self_nickname = ""
         self.delivery_wait_seconds = float(os.environ.get("WX_BRIDGE_SEND_VERIFY_SECONDS", "12"))
         self.debug = os.environ.get("WX_BRIDGE_WXAUTO_DEBUG") == "1"
+        patch_wxautox4_clipboard()
         self._seen = {group: [] for group in self.groups}
+        self._seeded = set()
+        self._last_refresh = {group: 0.0 for group in self.groups}
+        self._minimized_warned = {}
+        # GetSubWindow on a missing window is itself slow, so retrying the
+        # detached window must stay rare.
+        self.fallback_retry_seconds = 120.0
         self._seen_limit = 500
         self._state_lock = threading.Lock()
+        # Resolving a ChatBox costs ~1.6s of UIA while reading rows from a live
+        # one costs 0.02s, so every read path shares this per-window cache.
+        self._boxes = {}
+        self._box_rows = {}
         self._image_dir = Path(tempfile.gettempdir()) / "wxautox4-images"
 
         factory = wechat_factory or _load_wechat
@@ -149,13 +199,14 @@ class WxAutoX4Backend:
                 self.self_nickname = ""
         for group in self.groups:
             self._ensure_chat(group)
-        # 启动时已经在窗口里的旧消息不算新消息。
+        # Old rows already in the window are not new messages.  Fallback chats
+        # are seeded after the first real switch (see _seed_fallback).
         for group in self.groups:
             chat = self.chats.get(group)
-            if chat is None:
+            if chat is None or chat is self.wx:
                 continue
             try:
-                for message in (chat.GetAllMessage() or []):
+                for message in (self._all_messages(chat) or []):
                     self._remember(group, message)
             except Exception:
                 pass
@@ -172,13 +223,20 @@ class WxAutoX4Backend:
                 self.fallback.discard(group)
                 self.errors.pop(group, None)
             return chat
-        # 有些会话（例如「文件传输助手」）不能拆成独立窗口，就在主窗口里
-        # 切过去读写；功能一致，只是每次要多一次会话切换。
+        # Some conversations (e.g. 文件传输助手) cannot detach; switch the main
+        # window to them for every read rather than failing.
         with self._state_lock:
             self.chats[group] = self.wx
             self.fallback.add(group)
             self.errors.pop(group, None)
         return self.wx
+
+    def _warn_minimized(self, group):
+        now = time.monotonic()
+        if now - self._minimized_warned.get(group, 0.0) < 60.0:
+            return
+        self._minimized_warned[group] = now
+        logging.warning("微信窗口「%s」被最小化，已自动还原：最小化时 UIA 读不到任何消息", group)
 
     def health(self):
         with self._state_lock:
@@ -189,6 +247,7 @@ class WxAutoX4Backend:
             "groups": list(self.groups),
             "listening": listening,
             "errors": errors,
+            "fallback": sorted(self.fallback),
             "supportsVoice": self.supports_voice,
         }
 
@@ -203,23 +262,68 @@ class WxAutoX4Backend:
             del seen[: len(seen) - self._seen_limit]
         return True
 
+    def _seed_fallback(self, group):
+        """Mark the group's already-visible rows as seen after switching to it."""
+        if group in self._seeded:
+            return
+        try:
+            messages = self._all_messages(self.wx) or []
+        except Exception:
+            return
+        for message in messages:
+            self._remember(group, message)
+        self._seeded.add(group)
+
     def poll(self):
         messages = []
         for group in self.groups:
             chat = self.chats.get(group) or self._ensure_chat(group)
             if chat is None:
                 continue
+            now = time.monotonic()
+            if group in self.fallback:
+                # Fallback reads mean switching the main window every cycle, which
+                # rebuilds the UIA tree and re-reports rows.  A detached window can
+                # appear long after startup (WeChat restores it, or the user opens
+                # it), so keep offering it the chance to take over.
+                if now - self._last_refresh.get(group, 0.0) >= self.fallback_retry_seconds:
+                    self._last_refresh[group] = now
+                    chat = self._ensure_chat(group)
+            elif now - self._last_refresh.get(group, 0.0) >= 5.0:
+                # The detached window's UIA tree is rebuilt after screenshots
+                # and sends; a cached ChatBox then reads an empty old list.
+                # Re-attach periodically so a repaint cannot silence the poll.
+                try:
+                    fresh_chat = self.wx.GetSubWindow(group)
+                except Exception:
+                    fresh_chat = None
+                if fresh_chat is not None:
+                    with self._state_lock:
+                        self.chats[group] = fresh_chat
+                        self.errors.pop(group, None)
+                    chat = fresh_chat
+                self._last_refresh[group] = now
+            if self._restore_window(chat):
+                self._warn_minimized(group)
             try:
+                # Read visible rows and dedupe with our own _seen list.
+                # GetNewMessage() filters through ChatBox.used_msg_ids; delivery
+                # checks can advance it and silently drop the next message.
                 if group in self.fallback:
                     if not self.wx.ChatWith(group, exact=True):
                         raise RuntimeError("切换会话失败")
-                    fresh = self.wx.GetNewMessage()
+                    # The main window now shows another chat: its cached box is
+                    # bound to the previous one.
+                    self._drop_box(self.wx)
+                    self._seed_fallback(group)
+                    fresh = self._all_messages(self.wx)
                 else:
-                    fresh = chat.GetNewMessage()
+                    fresh = self._all_messages(chat)
+                if fresh is None:
+                    raise RuntimeError("读取会话消息失败")
             except Exception as error:
                 with self._state_lock:
                     self.errors[group] = f"GetNewMessage: {type(error).__name__}: {error}"
-                    # 子窗口可能被关掉/被微信重绘，下一轮重新开。
                     self.chats.pop(group, None)
                 continue
             with self._state_lock:
@@ -231,6 +335,44 @@ class WxAutoX4Backend:
                 if converted:
                     messages.append(converted)
         return messages
+
+    def _sender_from_avatar(self, group, message):
+        """Return ``(sender_key, is_self)`` from the row avatar.
+
+        Group nicknames are not exposed by UIA, but every row paints a stable
+        avatar.  A hash of the left avatar gives us a per-user key without OCR.
+        """
+        target = self.chats.get(group) or self.wx
+        box = self._read_box(target)
+        if box is None:
+            return None, None
+        try:
+            image, origin_x, origin_y = box._capture_client()
+        except Exception:
+            return None, None
+        if image is None:
+            return None, None
+        try:
+            rect = message.control.BoundingRectangle
+        except Exception:
+            return None, None
+        left = rect.left - origin_x
+        top = rect.top - origin_y
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if left < 0 or top < 0 or width < 120 or height < AVATAR_SIZE:
+            return None, None
+        left_best = _best_avatar_crop(image, left, top, width, "left")
+        right_best = _best_avatar_crop(image, left, top, width, "right")
+        left_score = left_best[0] if left_best else 0.0
+        right_score = right_best[0] if right_best else 0.0
+        # Only skip as self when the right avatar is clearly dominant.  A dark
+        # friend avatar next to a colourful bubble must not lose the message.
+        if right_score >= 20 and right_score > left_score * 2 and left_score < 8:
+            return None, True
+        if left_score >= AVATAR_MIN_SCORE:
+            return "用户#" + _avatar_hash(left_best[1]), False
+        return None, None
 
     def _convert(self, group, message):
         msg_type = str(getattr(message, "type", "") or "").lower()
@@ -244,19 +386,23 @@ class WxAutoX4Backend:
                 content = "[图片]"
             else:
                 return None
-        # 群聊昵称不在 UIA 树里，wxautox4-open 只能给空；bridge 会显示为「未知」。
-        sender = str(getattr(message, "sender", "") or getattr(message, "sender_remark", "") or "未知")
+        sender_key = None
+        if msg_type in ("text", "quote"):
+            sender_key, is_self = self._sender_from_avatar(group, message)
+            if is_self:
+                return None
+        # Group nicknames are not in the UIA tree; bridge shows them as 未知.
+        sender = sender_key or str(
+            getattr(message, "sender", "") or getattr(message, "sender_remark", "") or "未知"
+        )
         msg_id = "wxautox4-" + uuid.uuid4().hex
         media = MEDIA_RE.match(content)
         is_image = msg_type == "image" or bool(media and media.group(1) == "图片")
         is_sticker = msg_type == "emotion"
-        captured = None
+        attach = None
         if is_sticker and self.vision_enabled:
             from collector.capture import capture_message
-            captured = capture_message(message)
-        attach = None
-        if is_sticker:
-            attach = captured
+            attach = capture_message(message)
         elif is_image and self.vision_enabled:
             attach = ImageHandle(message, self._image_dir)
         return {
@@ -269,46 +415,169 @@ class WxAutoX4Backend:
             **({"_imageMessage": attach} if attach is not None else {}),
         }
 
-    # -- outbound ------------------------------------------------------------
-    def _check_send_result(self, result):
+    # -- outbound delivery ---------------------------------------------------
+    @staticmethod
+    def _send_ok(result):
         if result is None:
-            return
+            return True
         if isinstance(result, dict):
-            if result.get("ok") is False or result.get("status") not in (None, "成功", "success"):
-                raise RuntimeError(f"wxautox4 send failed: {result!r}")
-            return
-        if result is not True:
+            return (result.get("ok") is not False
+                    and result.get("status") in (None, "成功", "success"))
+        return result is True
+
+    def _check_send_result(self, result):
+        if not self._send_ok(result):
             raise RuntimeError(f"wxautox4 send failed: {result!r}")
 
-    def _self_signature(self, target):
+    def _chatbox_for(self, target):
         try:
-            messages = target.GetAllMessage() or []
+            return self.wx.core.get_chatbox() if target is self.wx else target._chatbox()
         except Exception:
             return None
-        ids = sorted(
-            str(getattr(message, "runtime_id", "") or getattr(message, "id", "") or "")
-            for message in messages
-            if _attr(message) == "self"
-        )
-        return ids if any(ids) else [str(len(ids))]
 
-    def _wait_until_delivered(self, target, before, timeout=None):
+    def _remember_box(self, target, box):
+        if box is None:
+            return
+        key = self._window_handle(target) or id(target)
+        # Keep the window object alive next to its box: a detached Chat can be
+        # replaced by the periodic re-attach without costing another resolve.
+        self._boxes[key] = (target, box)
+        self._box_rows.pop(key, None)
+
+    def _read_box(self, target):
+        key = self._window_handle(target) or id(target)
+        cached = self._boxes.get(key)
+        if cached is not None:
+            return cached[1]
+        box = self._chatbox_for(target)
+        self._remember_box(target, box)
+        return box
+
+    def _drop_box(self, target):
+        key = self._window_handle(target) or id(target)
+        self._boxes.pop(key, None)
+        self._box_rows.pop(key, None)
+
+    def _all_messages(self, target):
+        """Read visible rows without advancing the poller's used-id cursor.
+
+        ChatBox.get_msgs() marks every row as used, so a delivery check during
+        a send would silently swallow messages that arrived in the meantime.
+        """
+        key = self._window_handle(target) or id(target)
+        for _attempt in (0, 1):
+            box = self._read_box(target)
+            if not callable(getattr(box, "get_msgs", None)):
+                try:
+                    return target.GetAllMessage() or []
+                except Exception:
+                    return None
+            used = set(getattr(box, "used_msg_ids", ()))
+            try:
+                messages = box.get_msgs() or []
+            except Exception:
+                messages = None
+            finally:
+                try:
+                    box.used_msg_ids = used
+                except Exception:
+                    pass
+            if messages is None:
+                self._drop_box(target)
+                continue
+            had_rows = self._box_rows.get(key)
+            self._box_rows[key] = len(messages)
+            # WeChat rebuilds the tree after a repaint or a send; a box that read
+            # rows before and now reads none is stale, not an emptied chat.
+            if not messages and had_rows:
+                self._drop_box(target)
+                continue
+            return messages
+        return None
+
+    def _message_ids(self, target):
+        messages = self._all_messages(target) or []
+        return {identity for identity in (_message_identity(m) for m in messages) if identity}
+
+    def _signature(self, target, kinds):
+        messages = self._all_messages(target)
+        if messages is None:
+            return None
+        matched = [message for message in messages if _message_type(message) in kinds]
+        identities = [identity for identity in (_message_identity(message) for message in matched) if identity]
+        return identities or [f"count:{len(matched)}"]
+
+    def _wait_for_new(self, target, before, kinds, timeout=None):
         timeout = self.delivery_wait_seconds if timeout is None else timeout
-        if before is None or timeout <= 0:
-            return True
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            after = self._self_signature(target)
-            if after is not None and after != before:
-                return True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            for message in self._all_messages(target) or []:
+                if _message_type(message) not in kinds:
+                    continue
+                identity = _message_identity(message)
+                if identity and identity not in before:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
             time.sleep(0.5)
-        return False
+
+    def _mark_new_kind(self, target, before, kinds, content=None, group=None):
+        """Mark our own just-sent rows as seen so the poller ignores them."""
+        box = self._read_box(target)
+        if box is None:
+            return
+        needle = content.strip() if content is not None else None
+        for message in self._all_messages(target) or []:
+            if _message_type(message) not in kinds:
+                continue
+            if needle is not None and str(getattr(message, "content", "") or "").strip() != needle:
+                continue
+            identity = _message_identity(message)
+            if not identity or identity in before:
+                continue
+            control = getattr(message, "control", None)
+            try:
+                box.used_msg_ids.add(tuple(control.GetRuntimeId()))
+            except Exception:
+                pass
+            if group is not None:
+                self._remember(group, message)
 
     def send(self, group, text, at=None):
         if group not in self.groups:
             raise ValueError(f"group not allowed: {group}")
-        result = self.wx.SendMsg(text, who=group, at=at or None, exact=True)
+        target = self._chat_target(group)
+        if target is self.wx:
+            box = self._switch_main_chat(group)
+            if box is None:
+                raise RuntimeError(f"切换会话失败：{group}")
+        else:
+            box = None
+        if target is self.wx:
+            if at:
+                try:
+                    box.clear_edit()
+                except Exception:
+                    pass
+                if self._send_ok(box.input_at(at)):
+                    # clear=True would wipe the mention chip just inserted.
+                    result = box.send_text(text, clear=False)
+                else:
+                    try:
+                        box.clear_edit()
+                    except Exception:
+                        pass
+                    result = box.send_text(text)
+            else:
+                result = box.send_text(text)
+        else:
+            result = target.SendMsg(text, at=at or None)
+            if at and not self._send_ok(result):
+                # The member may be unknown/renamed; a plain reply beats none.
+                result = target.SendMsg(text)
         self._check_send_result(result)
+        # No reread here: the next poll's avatar-side check skips our own text
+        # rows, and avoiding two GetAllMessage passes keeps replies snappy.
         return {"ok": True}
 
     def _chat_target(self, group):
@@ -316,24 +585,6 @@ class WxAutoX4Backend:
         if chat is None:
             chat = self._ensure_chat(group)
         return chat or self.wx
-
-    def send_file(self, group, filepath, *, what="文件"):
-        if group not in self.groups:
-            raise ValueError(f"group not allowed: {group}")
-        target = self._chat_target(group)
-        before = self._self_signature(target)
-        if target is self.wx:
-            result = self.wx.SendFiles(filepath, who=group, exact=True)
-        else:
-            result = target.SendFiles(filepath)
-        self._check_send_result(result)
-        if not self._wait_until_delivered(target, before):
-            raise RuntimeError(f"{what}未确认送达：微信里没有出现新的发送记录")
-        return {"ok": True, "delivered": True}
-
-    def send_sticker(self, group, filepath, sticker_id):
-        result = self.send_file(group, filepath, what="图片")
-        return {**result, "stickerId": sticker_id}
 
     def _rebuild(self):
         """Drop cached UIA handles and re-attach after a COM event failure."""
@@ -346,28 +597,3 @@ class WxAutoX4Backend:
             return
         for group in self.groups:
             self._ensure_chat(group)
-
-    def _send_voice_once(self, group, filepath):
-        target = self._chat_target(group)
-        before = self._self_signature(target)
-        if hasattr(target, "SendAudio"):
-            result = target.SendAudio(filepath)
-        else:
-            result = self.wx.SendAudio(filepath, who=group, exact=True)
-        self._check_send_result(result)
-        if not self._wait_until_delivered(target, before):
-            raise RuntimeError("语音未确认送达：微信里没有出现新的语音气泡")
-        return {"ok": True, "delivered": True, "voice": True}
-
-    def send_voice(self, group, filepath):
-        """Send a native voice bubble, rebuilding the UIA session once on COM errors."""
-        if group not in self.groups:
-            raise ValueError(f"group not allowed: {group}")
-        try:
-            return self._send_voice_once(group, filepath)
-        except Exception as error:
-            if not _is_com_event_error(error):
-                raise
-            self.errors[group] = "UIA 事件订阅失效，已重建窗口重试"
-            self._rebuild()
-            return self._send_voice_once(group, filepath)
