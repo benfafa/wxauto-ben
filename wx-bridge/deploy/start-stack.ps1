@@ -70,13 +70,12 @@ function Stop-Match([string]$pattern, [string]$why) {
 # Identity of the WeChat main process. WeChat rebuilds every window handle when
 # it restarts (update, crash, manual relaunch), and the collector keeps reading
 # its dead UIA tree: health stays ok while nothing new is ever picked up.
+# A "restart" can also keep the process and only rebuild the window, so the
+# handle has to be part of the identity or the change goes unnoticed.
 function Get-WeixinKey {
     $main = @(Get-Process Weixin -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
-    if ($main.Count -eq 0) {
-        $main = @(Get-Process Weixin -ErrorAction SilentlyContinue | Sort-Object StartTime)
-    }
     if ($main.Count -eq 0) { return $null }
-    return ('' + $main[0].Id + '|' + $main[0].StartTime.ToFileTime())
+    return ('' + $main[0].Id + '|' + $main[0].StartTime.ToFileTime() + '|' + $main[0].MainWindowHandle)
 }
 
 Write-Runner 'dsh' 'C:\npm-global\dsh.cmd web --no-open'

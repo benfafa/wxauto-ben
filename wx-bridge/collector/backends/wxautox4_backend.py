@@ -176,6 +176,7 @@ class WxAutoX4Backend(DesktopMixin, FileMixin, VoiceMixin):
         self._seeded = set()
         self._last_refresh = {group: 0.0 for group in self.groups}
         self._minimized_warned = {}
+        self._missing_window = {}
         # GetSubWindow on a missing window is itself slow, so retrying the
         # detached window must stay rare.
         self.fallback_retry_seconds = 120.0
@@ -230,6 +231,29 @@ class WxAutoX4Backend(DesktopMixin, FileMixin, VoiceMixin):
             self.fallback.add(group)
             self.errors.pop(group, None)
         return self.wx
+
+    def _missed_window(self, group):
+        # Two consecutive misses: one flaky UIA lookup is not proof the window
+        # is gone, but the third one means we are reading a dead handle.
+        misses = self._missing_window.get(group, 0) + 1
+        self._missing_window[group] = misses
+        return misses >= 2
+
+    def _demote_to_fallback(self, group):
+        """Stop reading a detached window that no longer exists.
+
+        WeChat can rebuild its UI in place (restart without a new process): the
+        dead handle keeps answering with nothing while health still says ok.
+        """
+        logging.warning("群「%s」的独立窗口已消失，改用主窗口轮询；窗口恢复后会自动接管", group)
+        self._missing_window.pop(group, None)
+        with self._state_lock:
+            self.chats[group] = self.wx
+            self.fallback.add(group)
+        # Re-seed on the first switch so the main window's already visible rows
+        # are not replayed as new messages.
+        self._seeded.discard(group)
+        self._drop_box(self.wx)
 
     def _warn_minimized(self, group):
         now = time.monotonic()
@@ -293,6 +317,7 @@ class WxAutoX4Backend(DesktopMixin, FileMixin, VoiceMixin):
                 # The detached window's UIA tree is rebuilt after screenshots
                 # and sends; a cached ChatBox then reads an empty old list.
                 # Re-attach periodically so a repaint cannot silence the poll.
+                self._last_refresh[group] = now
                 try:
                     fresh_chat = self.wx.GetSubWindow(group)
                 except Exception:
@@ -302,7 +327,10 @@ class WxAutoX4Backend(DesktopMixin, FileMixin, VoiceMixin):
                         self.chats[group] = fresh_chat
                         self.errors.pop(group, None)
                     chat = fresh_chat
-                self._last_refresh[group] = now
+                    self._missing_window.pop(group, None)
+                elif self._missed_window(group):
+                    self._demote_to_fallback(group)
+                    continue
             if self._restore_window(chat):
                 self._warn_minimized(group)
             try:

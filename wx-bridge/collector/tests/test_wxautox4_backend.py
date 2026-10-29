@@ -250,6 +250,36 @@ class WindowSelfHealingTest(unittest.TestCase):
         self.assertIn(chat, restored)
 
 
+class DetachedWindowLossTest(unittest.TestCase):
+    """微信可以只重建窗口不换进程：死句柄读得到空列表却仍报健康。"""
+
+    def test_two_misses_demote_to_main_window_fallback(self):
+        chat = FakeChat([FakeMessage(content="一", rid=(1,))])
+
+        class Flaky(FakeWeChat):
+            def __init__(self, chats):
+                super().__init__(chats)
+                self.lost = False
+
+            def GetSubWindow(self, group):
+                return None if self.lost else self.chats.get(group)
+
+        fake = Flaky({"群A": chat})
+        backend = WxAutoX4Backend(["群A"], wechat_factory=lambda debug=False: fake)
+        self.assertEqual(backend.fallback, set())
+
+        fake.lost = True
+        backend._last_refresh["群A"] = 0.0
+        backend.poll()
+        self.assertEqual(backend.fallback, set(), "一次查不到窗口不该就降级")
+
+        backend._last_refresh["群A"] = 0.0
+        backend.poll()
+        self.assertIn("群A", backend.fallback)
+        self.assertIs(backend.chats["群A"], backend.wx)
+        self.assertNotIn("群A", backend._seeded, "降级后要重新播种，避免回放旧消息")
+
+
 class FileDialogCaptionTest(unittest.TestCase):
     """文件选择框的标题跟着系统语言和 shell 版本变，不能只认死几个词。"""
 
