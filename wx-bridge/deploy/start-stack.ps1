@@ -67,15 +67,19 @@ function Stop-Match([string]$pattern, [string]$why) {
     }
 }
 
-# Identity of the WeChat main process. WeChat rebuilds every window handle when
-# it restarts (update, crash, manual relaunch), and the collector keeps reading
-# its dead UIA tree: health stays ok while nothing new is ever picked up.
-# A "restart" can also keep the process and only rebuild the window, so the
-# handle has to be part of the identity or the change goes unnoticed.
+# Identity of the WeChat main process, used to notice a real restart (update,
+# crash, manual relaunch) so the collector can drop its now-dead UIA handles.
+#
+# Deliberately PID + start time only. MainWindowHandle flips whenever another
+# window becomes the process's "main" one — opening a detached chat window did
+# that every ~40 seconds and restarted the collector each time. A restart that
+# keeps the process and only rebuilds the window is handled inside the
+# collector instead: it demotes to main-window polling when a detached window
+# disappears, and re-adopts it once it is back.
 function Get-WeixinKey {
-    $main = @(Get-Process Weixin -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
-    if ($main.Count -eq 0) { return $null }
-    return ('' + $main[0].Id + '|' + $main[0].StartTime.ToFileTime() + '|' + $main[0].MainWindowHandle)
+    $procs = @(Get-Process Weixin -ErrorAction SilentlyContinue | Sort-Object StartTime)
+    if ($procs.Count -eq 0) { return $null }
+    return ('' + $procs[0].Id + '|' + $procs[0].StartTime.ToFileTime())
 }
 
 Write-Runner 'dsh' 'C:\npm-global\dsh.cmd web --no-open'
