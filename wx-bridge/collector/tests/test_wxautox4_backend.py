@@ -280,6 +280,49 @@ class DetachedWindowLossTest(unittest.TestCase):
         self.assertNotIn("群A", backend._seeded, "降级后要重新播种，避免回放旧消息")
 
 
+class DuplicateRowTest(unittest.TestCase):
+    """UIA 回收行会换 runtime id，同一条消息不能被再回一次。"""
+
+    def test_same_text_under_a_new_runtime_id_is_not_new(self):
+        backend, _ = make_backend({"群A": FakeChat()})
+        text = "@才不是鲸鱼娘 今晚吃了一尾肥鱼"
+        self.assertTrue(backend._remember("群A", FakeMessage(content=text, rid=(1, 1))))
+        self.assertFalse(backend._remember("群A", FakeMessage(content=text, rid=(1, 99))))
+
+    def test_different_texts_stay_distinct(self):
+        backend, _ = make_backend({"群A": FakeChat()})
+        self.assertTrue(backend._remember("群A", FakeMessage(content="甲说的", rid=(1, 1))))
+        self.assertTrue(backend._remember("群A", FakeMessage(content="乙说的", rid=(1, 2))))
+
+    def test_groups_do_not_share_the_dedupe_window(self):
+        backend, _ = make_backend({"群A": FakeChat(), "群B": FakeChat()})
+        text = "同一句话"
+        self.assertTrue(backend._remember("群A", FakeMessage(content=text, rid=(1, 1))))
+        self.assertTrue(backend._remember("群B", FakeMessage(content=text, rid=(2, 1))))
+
+    def test_placeholder_rows_are_not_deduped_by_text(self):
+        backend, _ = make_backend({"群A": FakeChat()})
+        first = FakeMessage(msg_type="image", content="[图片]", rid=(3, 1))
+        second = FakeMessage(msg_type="image", content="[图片]", rid=(3, 2))
+        self.assertTrue(backend._remember("群A", first))
+        self.assertTrue(backend._remember("群A", second))
+
+    def test_a_genuine_repeat_after_the_window_gets_through(self):
+        backend, _ = make_backend({"群A": FakeChat()})
+        backend.duplicate_window_seconds = 0.05
+        text = "好的"
+        self.assertTrue(backend._remember("群A", FakeMessage(content=text, rid=(4, 1))))
+        time.sleep(0.12)
+        self.assertTrue(backend._remember("群A", FakeMessage(content=text, rid=(4, 2))))
+
+    def test_the_dedupe_can_be_turned_off(self):
+        backend, _ = make_backend({"群A": FakeChat()})
+        backend.duplicate_window_seconds = 0.0
+        text = "关掉窗口"
+        self.assertTrue(backend._remember("群A", FakeMessage(content=text, rid=(5, 1))))
+        self.assertTrue(backend._remember("群A", FakeMessage(content=text, rid=(5, 2))))
+
+
 class FileDialogCaptionTest(unittest.TestCase):
     """文件选择框的标题跟着系统语言和 shell 版本变，不能只认死几个词。"""
 
@@ -398,15 +441,17 @@ class PollTest(unittest.TestCase):
         self.assertEqual([event["kind"] for event in events], ["text", "text"])
 
     def test_does_not_replay_the_same_row_twice(self):
-        message = FakeMessage(content="只发一次", rid=(5, 5))
         chat = FakeChat()
         backend, _ = make_backend({"群A": chat})
-        chat.messages.append(message)
+        chat.messages.append(FakeMessage(content="只发一次", rid=(5, 5)))
         self.assertEqual(len(backend.poll()), 1)
         chat.messages.append(FakeMessage(content="只发一次", rid=(5, 5)))
         self.assertEqual(backend.poll(), [])
-        # 内容相同但控件不同（真的又发了一条）仍然要转发。
+        # UIA 把行回收后再放回来会换控件 id，同一条文字不能被当成新消息再回一次。
         chat.messages.append(FakeMessage(content="只发一次", rid=(5, 6)))
+        self.assertEqual(backend.poll(), [])
+        # 换了内容就还是新消息。
+        chat.messages.append(FakeMessage(content="换个说法", rid=(5, 7)))
         self.assertEqual(len(backend.poll()), 1)
 
     def test_startup_backlog_is_not_forwarded(self):

@@ -89,7 +89,7 @@ def _chat_name(message, default):
 
 
 def _runtime_key(message):
-    """Identity that stays stable while the row exists but differs for repeats."""
+    """Row identity from UIA. Volatile: a recycled row comes back with a new id."""
     control = getattr(message, "control", None)
     runtime = ()
     try:
@@ -102,6 +102,24 @@ def _runtime_key(message):
 
 def _message_type(message):
     return str(getattr(message, "type", "") or "").lower()
+
+
+DEDUP_TYPES = ("text", "quote")
+
+
+def _content_key(message):
+    """Identity that survives UIA recycling a row, for rows that carry text.
+
+    A row's runtime id changes when WeChat scrolls it out and back — which our
+    own reply reliably triggers — so the trigger message would look new again and
+    get answered twice. WeChat exposes no per-row timestamp here (``time`` is
+    None), so the visible text is the only stable handle. Placeholder rows
+    (image/sticker/file) are excluded: their "content" is not distinguishing.
+    """
+    if _message_type(message) not in DEDUP_TYPES:
+        return None
+    content = str(getattr(message, "content", "") or "").strip()
+    return content or None
 
 
 def _message_identity(message):
@@ -173,6 +191,10 @@ class WxAutoX4Backend(DesktopMixin, FileMixin, VoiceMixin):
         self.debug = os.environ.get("WX_BRIDGE_WXAUTO_DEBUG") == "1"
         patch_wxautox4_clipboard()
         self._seen = {group: [] for group in self.groups}
+        self._recent = {}
+        # A row that scrolls out and back comes with a fresh UIA runtime id;
+        # identical visible text inside this window is the same message.
+        self.duplicate_window_seconds = float(os.environ.get("WX_BRIDGE_DUPLICATE_WINDOW_SECONDS", "60"))
         self._seeded = set()
         self._last_refresh = {group: 0.0 for group in self.groups}
         self._minimized_warned = {}
@@ -281,6 +303,27 @@ class WxAutoX4Backend(DesktopMixin, FileMixin, VoiceMixin):
         seen = self._seen.setdefault(group, [])
         if key in seen:
             return False
+        content_key = _content_key(message)
+        if content_key is not None and self._is_repeat(group, content_key):
+            self._note_seen(group, key)
+            return False
+        return self._note_seen(group, key)
+
+    def _is_repeat(self, group, content_key):
+        """Same visible text already forwarded? UIA gave the row a new id."""
+        window = self.duplicate_window_seconds
+        if window <= 0:
+            return False
+        now = time.monotonic()
+        recent = self._recent.setdefault(group, [])
+        recent[:] = [item for item in recent if now - item[0] <= window]
+        if any(item[1] == content_key for item in recent):
+            return True
+        recent.append((now, content_key))
+        return False
+
+    def _note_seen(self, group, key):
+        seen = self._seen.setdefault(group, [])
         seen.append(key)
         if len(seen) > self._seen_limit:
             del seen[: len(seen) - self._seen_limit]
